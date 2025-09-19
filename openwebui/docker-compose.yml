@@ -57,7 +57,7 @@ services:
 
   # Open WebUI — NAMA SERVICE HARUS "open-webui" (dengan tanda hubung!)
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:latest
     restart: unless-stopped
     depends_on:   # ← HAPUS mcp-server dari sini
       - db
@@ -89,18 +89,16 @@ services:
       - ENABLE_FILE_UPLOAD=${ENABLE_FILE_UPLOAD}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP}
       - USER_ROLE=${USER_ROLE}
-      - LDAP_ENABLED=${LDAP_ENABLED}
-      - LDAP_SERVER=${LDAP_SERVER}
-      - LDAP_BIND_DN=${LDAP_BIND_DN}
-      - LDAP_BIND_PASSWORD=${LDAP_BIND_PASSWORD}
-      - LDAP_USERS_DN=${LDAP_USERS_DN}
-      - LDAP_GROUPS_DN=${LDAP_GROUPS_DN}
-      - LDAP_USER_OBJECTCLASS=${LDAP_USER_OBJECTCLASS}
-      - LDAP_USERNAME_ATTRIBUTE=${LDAP_USERNAME_ATTRIBUTE}
-      - LDAP_RDN_ATTRIBUTE=${LDAP_RDN_ATTRIBUTE}
-      - LDAP_UUID_ATTRIBUTE=${LDAP_UUID_ATTRIBUTE}
-      - LDAP_USER_FILTER=${LDAP_USER_FILTER}
       - MCP_SERVER_CUSTOM_URL=${MCP_SERVER_CUSTOM_URL}  # ← Tetap ada, hanya URL referensi
+      - OIDC_ENABLED=${OIDC_ENABLED}
+      - OIDC_ISSUER=${OIDC_ISSUER}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI}
+      - OIDC_USERNAME_ATTRIBUTE=${OIDC_USERNAME_ATTRIBUTE}
+      - OIDC_EMAIL_ATTRIBUTE=${OIDC_EMAIL_ATTRIBUTE}
+      - OIDC_NAME_ATTRIBUTE=${OIDC_NAME_ATTRIBUTE}
+      - OIDC_SCOPE=${OIDC_SCOPE}
     volumes:
       - ./static:/app/static
     networks:
