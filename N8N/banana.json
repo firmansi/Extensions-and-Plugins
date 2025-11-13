@@ -1,0 +1,115 @@
+{
+  "name": "Gemini Image - Nano Banana",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "2",
+      "name": "HTTP Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{$env.GEMINI_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "{\"contents\":[{\"parts\":[{\"text\":\"Create a picture of a nano banana dish in a fancy restaurant with a Gemini theme\"}]}]}",
+        "options": {}
+      }
+    },
+    {
+      "id": "3",
+      "name": "Extract Image (Function)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const data = items[0].json;\nfunction findBase64(obj) {\n  if (obj == null) return null;\n  if (typeof obj === 'string') {\n    // crude check for base64-like string\n    if (obj.length > 100 && /^[A-Za-z0-9+\\/=\\n\\r]+$/.test(obj.replace(/\\s+/g, ''))) return obj.replace(/\\s+/g, '');\n    return null;\n  }\n  if (Array.isArray(obj)) {\n    for (const el of obj) {\n      const res = findBase64(el);\n      if (res) return res;\n    }\n  } else if (typeof obj === 'object') {\n    for (const k of Object.keys(obj)) {\n      const res = findBase64(obj[k]);\n      if (res) return res;\n    }\n  }\n  return null;\n}\nconst b64 = findBase64(data);\nif (!b64) throw new Error('No base64 image string found in response');\nconst buffer = Buffer.from(b64, 'base64');\nreturn [{ json: {}, binary: { data: buffer } }];"
+      }
+    },
+    {
+      "id": "4",
+      "name": "Write Binary File",
+      "type": "n8n-nodes-base.writeBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "filePath": "/tmp/",
+        "fileName": "gemini-native-image.png",
+        "binaryData": "data",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Extract Image (Function)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Image (Function)": {
+      "main": [
+        [
+          {
+            "node": "Write Binary File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {}
+}
