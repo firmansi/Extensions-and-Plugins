@@ -1,0 +1,301 @@
+"""
+title: Qwen Image Generator
+description: Generate images with Qwen API hosted on Alibaba Cloud DashScope
+author: dfirmans
+version: 1.0
+"""
+
+from typing import (
+    Literal,
+)
+import os
+import json
+import requests
+import time
+from pydantic import BaseModel, Field
+
+# Image size options based on Qwen API documentation
+ImageSizeType = Literal[
+    "512*512",
+    "768*768",
+    "1024*1024",
+    "1280*720",
+    "720*1280",
+    "1328*1328",
+    "1600*900",
+    "900*1600",
+    "1920*1080",
+    "1080*1920",
+]
+
+# Qwen image generation models
+ModelType = Literal[
+    "qwen-image-plus",
+    # Add more models as they become available
+]
+
+
+class Tools:
+    class Valves(BaseModel):
+        DASHSCOPE_API_KEY: str = Field(
+            default="",
+            description="Your Alibaba Cloud DashScope API key",
+        )
+        DASHSCOPE_BASE_URL: str = Field(
+            default="https://dashscope-intl.aliyuncs.com/api/v1",
+            description="DashScope API base URL (Singapore region)",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves(
+            DASHSCOPE_API_KEY=os.getenv("DASHSCOPE_API_KEY", ""),
+            DASHSCOPE_BASE_URL=os.getenv(
+                "DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/api/v1"
+            ),
+        )
+
+    async def generate_image_qwen(
+        self,
+        image_prompt: str,
+        image_size: ImageSizeType = "1024*1024",
+        model: ModelType = "qwen-image-plus",
+        __event_emitter__=None,
+    ) -> str:
+        """
+        Generate an image using Qwen API
+
+        Whenever a description of an image is given, use this tool to create the image from a prompt.
+        You do not need to ask for permission to generate, just do it!
+        DO NOT write out the prompt before OR after generating the images. The prompt should ONLY ever be written out ONCE, in the `"image_prompt"` field of the request.
+
+        The image_prompt sent to this tool must abide by the following policies:
+        1. The prompt should be in English. If the image description was not in English, then translate it.
+        2. Always mention the image type (photo, oil painting, watercolor painting, illustration, cartoon, drawing, vector, render, etc.) in the beginning of the prompt. Unless the description suggests otherwise.
+        3. The prompt must intricately describe every part of the image in concrete, objective detail. THINK about what the end goal of the description is, and extrapolate that to what would make satisfying images.
+        4. The prompt should be a paragraph of text that is extremely descriptive and detailed. It should be more than 3 sentences long.
+        5. If the user requested modifications to a previous image, the prompt should not simply be longer, but rather it should be refactored to integrate the suggestions.
+
+        The image_size should be selected by picking the most suitable one for the image.
+        Available sizes based on Qwen API:
+        - "512*512" (1:1) - for small square images
+        - "768*768" (1:1) - medium square images
+        - "1024*1024" (1:1) - default high-quality square images
+        - "1280*720" (16:9) - widescreen format
+        - "720*1280" (9:16) - vertical mobile format
+        - "1328*1328" (1:1) - large square format
+        - "1600*900" (16:9) - high resolution widescreen
+        - "900*1600" (9:16) - high resolution vertical
+        - "1920*1080" (16:9) - full HD widescreen
+        - "1080*1920" (9:16) - full HD vertical
+
+        :param image_prompt: Text prompt for image generation.
+        :param image_size: Size of the generated image.
+        :param model: Qwen model to use for generation.
+        """
+
+        try:
+            # Emit status events for UI feedback
+            for _ in range(2):
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Generating image with Qwen Image Plus...",
+                            "done": False,
+                        },
+                    }
+                )
+
+            api_key = self.valves.DASHSCOPE_API_KEY
+            base_url = self.valves.DASHSCOPE_BASE_URL
+
+            if not api_key:
+                raise ValueError("DASHSCOPE_API_KEY is not set")
+
+            image_url = generate_image_with_qwen_api(
+                api_key, base_url, image_prompt, image_size, model
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Generated image successfully:",
+                        "done": True,
+                    },
+                }
+            )
+
+            await __event_emitter__(
+                {
+                    "type": "message",
+                    "data": {
+                        "content": f"![{image_prompt}]({image_url})  \n**Size:** `{image_size}`  **Model:** `{model}`  **Prompt:** `{image_prompt}`  \n"
+                    },
+                }
+            )
+
+            # This aims to work around an LLM "temporal confusion" problem.
+            # It gets confused when we invisibly speak on its behalf.
+            return f"""
+The image generation completed successfully!
+
+Note that the generated image ALREADY HAS been automatically sent and displayed to the user by the tool.
+You don't need to do anything to show the image to the user.
+
+When you answer now - simply tell the user the image was successfully generated.
+Answer with text only, NO IMAGES, NO SIZE, NO MODEL, NO IMAGE PROMPT.
+Just tell the user that the image was successfully generated.
+
+At the end of your answer you might ask the user if they want anything changed to the image.
+Should they later come back and ask for changes - just generate a new image with potentially modified parameters based on their feedback.
+
+Keep your answer short and concise.
+"""
+
+        except Exception as e:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": f"An error occurred: {e}", "done": True},
+                }
+            )
+
+            return f"Tell the user: {e}"
+
+
+def generate_image_with_qwen_api(
+    api_key: str,
+    base_url: str,
+    prompt: str,
+    size: ImageSizeType,
+    model: ModelType,
+) -> str:
+    """
+    Generate image using Qwen API
+
+    :param api_key: DashScope API key
+    :param base_url: DashScope API base URL
+    :param prompt: Text prompt for image generation
+    :param size: Image size
+    :param model: Model to use for generation
+    :return: URL of the generated image
+    """
+
+    # Step 1: Create task and get task_id
+    # Prepare the request payload for task creation
+    payload = {
+        "model": model,
+        "input": {
+            "prompt": prompt,
+            "size": size,
+            "n": 1,
+        },
+        "parameters": {
+            "watermark": False,
+        },
+    }
+
+    # Prepare headers
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-DashScope-Async": "enable",  # Enable async for task creation
+    }
+
+    try:
+        # Step 1: Create the image generation task
+        create_url = f"{base_url}/services/aigc/text2image/image-synthesis"
+
+        response = requests.post(
+            create_url,
+            headers=headers,
+            json=payload,
+            timeout=30,  # Shorter timeout for task creation
+        )
+
+        if response.status_code != 200:
+            error_msg = f"Task creation failed - HTTP {response.status_code}"
+            try:
+                error_data = response.json()
+                if "message" in error_data:
+                    error_msg += f": {error_data['message']}"
+                if "code" in error_data:
+                    error_msg += f" (Code: {error_data['code']})"
+            except:
+                error_msg += f": {response.text}"
+
+            raise Exception(error_msg)
+
+        # Get task_id from response
+        result = response.json()
+        if "output" not in result or "task_id" not in result["output"]:
+            raise ValueError(
+                f"No task_id found in response: {json.dumps(result, indent=2)}"
+            )
+
+        task_id = result["output"]["task_id"]
+
+        # Step 2: Poll for task completion
+        query_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+
+        query_url = f"{base_url}/tasks/{task_id}"
+        max_attempts = 40  # 40 attempts * 3 seconds = 2 minutes max
+
+        for attempt in range(max_attempts):
+            time.sleep(3)  # Wait 3 seconds between polls
+
+            query_response = requests.get(query_url, headers=query_headers, timeout=30)
+
+            if query_response.status_code != 200:
+                continue  # Continue polling on temporary errors
+
+            query_result = query_response.json()
+
+            if "output" not in query_result:
+                continue
+
+            task_status = query_result["output"].get("task_status", "")
+
+            if task_status == "SUCCEEDED":
+                # Extract image URL from successful result
+                if "results" in query_result["output"]:
+                    results = query_result["output"]["results"]
+                    if results and len(results) > 0 and "url" in results[0]:
+                        return results[0]["url"]
+
+                raise ValueError(
+                    f"No image URL found in successful response: {json.dumps(query_result, indent=2)}"
+                )
+
+            elif task_status == "FAILED":
+                error_msg = "Task failed"
+                if "code" in query_result["output"]:
+                    error_msg += f" (Code: {query_result['output']['code']})"
+                if "message" in query_result["output"]:
+                    error_msg += f": {query_result['output']['message']}"
+
+                raise Exception(error_msg)
+
+            elif task_status in ["PENDING", "RUNNING"]:
+                continue  # Keep polling
+
+            else:
+                # Unknown status, continue polling
+                continue
+
+        # If we get here, the task didn't complete within the timeout
+        raise Exception("Task timeout - Image generation took too long (>2 minutes)")
+
+    except requests.exceptions.Timeout:
+        raise Exception("Request timeout - Network request took too long")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Request error: {str(e)}")
+    except Exception as e:
+        if "Qwen API error" in str(e):
+            raise e
+        raise Exception(f"Qwen API error: {str(e)}")
