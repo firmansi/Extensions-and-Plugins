@@ -1,0 +1,279 @@
+{
+  "name": "AI Question Generator & Evaluator",
+  "nodes": [
+    {
+      "id": "webhook-trigger-node",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "question-generator",
+        "responseMode": "responseNode",
+        "responseCode": 200,
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "webhookId": "question-generator-webhook"
+    },
+    {
+      "id": "model-manager-node",
+      "name": "Model Manager",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        500,
+        100
+      ],
+      "parameters": {
+        "model": "gemini-1.5-flash-001",
+        "temperature": 0.7
+      },
+      "credentials": {
+        "googleGeminiApi": {
+          "id": "gemini-api-key",
+          "name": "Google Gemini API credential"
+        }
+      }
+    },
+    {
+      "id": "memory-manager-node",
+      "name": "Memory Manager",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1,
+      "position": [
+        500,
+        200
+      ],
+      "parameters": {
+        "sessionKey": "={{ $json.sessionId || $json.topic }}"
+      }
+    },
+    {
+      "id": "question-generator-agent",
+      "name": "AI Agent 1 - Question Generator",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "Anda adalah seorang konsultan bisnis dengan pengalaman lebih dari 20 tahun. Sebagai seorang ahli strategi bisnis, silakan tanyakan terlebih dahulu jenis industri dari klien yang ingin diajak berdiskusi. Setelah itu, buatlah {{ $json.numberOfQuestions || 5 }} pertanyaan dengan tingkat kesulitan {{ $json.difficulty || 'sedang' }} yang relevan dengan jenis industri tersebut dan berdasarkan Business Model Canvas. Pastikan pertanyaan mencakup aspek-aspek berikut:\\n\\n1. VALUE PROPOSITION (Proposisi Nilai)\\n- Masalah apa yang ingin diselesaikan bagi pelanggan?\\n- Solusi apa yang ditawarkan? Apa keunikannya?\\n- Apakah produk/layanan mengurangi rasa sakit/kerugian atau menciptakan keuntungan?\\n- Apa yang membedakan dari kompetitor?\\n- Apa manfaat utama yang dirasakan customer (emosi/fungsi)?\\n\\n2. CUSTOMER SEGMENTS (Segmen Pelanggan)\\n- Siapa target customer? (demografi, psikografi, perilaku)\\n- Apakah ada niche market yang spesifik?\\n- Apakah customer mass market atau segmented?\\n- Apakah ada perbedaan antara pengguna dan yang membayar?\\n- Apa kebutuhan dan tantangan terbesar mereka?\\n\\n3. CHANNELS (Saluran)\\n- Bagaimana cara menjangkau customer? (online/offline)\\n- Channel mana yang paling efektif untuk awareness, evaluation, purchase, delivery, after-sales?\\n- Apakah menggunakan direct sales, distributor, marketplace, atau kombinasi?\\n- Bagaimana integrasi antara channel online dan offline?\\n\\n4. CUSTOMER RELATIONSHIPS (Hubungan Pelanggan)\\n- Jenis hubungan seperti apa yang ingin dibangun? (personal assist, self-service, automated, community)\\n- Bagaimana cara mendapatkan customer (acquisition)?\\n- Bagaimana cara mempertahankan customer (retention)?\\n- Apakah ada program loyalty atau membership?\\n\\n5. REVENUE STREAMS (Aliran Pendapatan)\\n- Dari mana uang masuk? (jual produk, subscription, freemium, commission, ads)\\n- Berapa harga jual dan strategi pricingnya?\\n- Apakah ada multiple revenue streams?\\n- Bagaimana cara pembayaran? (one-time, recurring, installment)\\n- Berapa estimasi lifetime value customer?\\n\\n6. KEY RESOURCES (Sumber Daya Utama)\\n- Sumber daya fisik apa yang dibutuhkan? (gedung, mesin, inventory)\\n- Sumber daya intelektual apa? (brand, patent, data, software)\\n- Sumber daya manusia apa yang kritis? (expertise, skill)\\n- Sumber daya finansial apa yang tersedia/dibutuhkan?\\n\\n7. KEY ACTIVITIES (Aktivitas Utama)\\n- Aktivitas produksi apa yang perlu dilakukan?\\n- Aktivitas problem-solving seperti apa?\\n- Platform/network management seperti apa?\\n- Apa saja aktivitas kritis yang harus berjalan agar Value Proposition tercapai?\\n\\n8. KEY PARTNERSHIPS (Kemitraan Kunci)\\n- Siapa supplier atau partner strategis?\\n- Apa yang didapatkan dari partnership tersebut? (resources, activities, supply chain)\\n- Apakah ada joint venture atau strategic alliance?\\n- Mana yang lebih baik: make or buy?\\n- Apakah ada ketergantungan pada platform tertentu?\\n\\n9. COST STRUCTURE (Struktur Biaya)\\n- Apa fixed cost terbesar? (salary, rent, utilities)\\n- Apa variable cost utama?\\n- Apakah cost structure leans toward cost-driven atau value-driven?\\n- Apa cost tersembunyi yang sering terlupakan?\\n- Berapa break-even point-nya?\\n\\nFormat output dalam JSON dengan struktur: {\"industry\": \"jenis industri\", \"questions\": [{\"id\": 1, \"question\": \"pertanyaan\", \"type\": \"multiple_choice/essay/short_answer\", \"answer\": \"jawaban benar\", \"options\": [\"opsi A\", \"opsi B\", \"opsi C\", \"opsi D\"], \"businessCanvasElement\": \"nama elemen business canvas\"}], \"metadata\": {\"topic\": \"topic\", \"difficulty\": \"difficulty\", \"generatedAt\": \"timestamp\", \"industry\": \"jenis industri\"}}"
+      },
+      "credentials": {
+        "googleGeminiApi": {
+          "id": "gemini-api-key",
+          "name": "Google Gemini API credential"
+        }
+      }
+    },
+    {
+      "id": "question-evaluator-agent",
+      "name": "AI Agent 2 - Question Evaluator",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        760,
+        300
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "Anda adalah seorang evaluator soal bisnis profesional. Evaluasi setiap pertanyaan berikut berdasarkan kriteria: 1. Kejelasan pertanyaan (1-5), 2. Kesesuaian dengan Business Model Canvas (1-5), 3. Relevansi dengan industri {{ $json.industry }} (1-5), 4. Tingkat kesulitan yang tepat (1-5), 5. Kelayakan sebagai soal ujian bisnis (1-5). Perhatikan apakah pertanyaan mencakup elemen-elemen Business Model Canvas: Value Proposition, Customer Segments, Channels, Customer Relationships, Revenue Streams, Key Resources, Key Activities, Key Partnerships, dan Cost Structure. Pertanyaan untuk dievaluasi: {{ $json.questions }}. Format output JSON: {\"evaluations\": [{\"questionId\": 1, \"clarity\": 4, \"relevanceToBusinessCanvas\": 5, \"industryRelevance\": 4, \"difficultyMatch\": 4, \"feasibility\": 5, \"overallScore\": 4.4, \"businessCanvasElement\": \"nama elemen business canvas\", \"feedback\": \"kritik dan saran perbaikan\"}], \"summary\": {\"averageScore\": 4.4, \"totalQuestions\": 5, \"quality\": \"baik/sedang/kurang\", \"industry\": \"jenis industri\"}}"
+      },
+      "credentials": {
+        "googleGeminiApi": {
+          "id": "gemini-api-key",
+          "name": "Google Gemini API credential"
+        }
+      }
+    },
+    {
+      "id": "data-table-node",
+      "name": "Data Table - Save to Database",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        760,
+        500
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "mode": "createNew",
+          "value": "question_evaluations"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $uuid() }}",
+            "topic": "={{ $json.topic }}",
+            "industry": "={{ $json.industry }}",
+            "questions": "={{ JSON.stringify($json.questions) }}",
+            "evaluations": "={{ JSON.stringify($json.evaluations) }}",
+            "average_score": "={{ $json.summary.averageScore }}",
+            "examiner_email": "={{ $json.examinerEmail }}",
+            "created_at": "={{ $now.toISOString() }}",
+            "status": "completed"
+          }
+        }
+      }
+    },
+    {
+      "id": "mailgun-node",
+      "name": "Mailgun - Send Email",
+      "type": "n8n-nodes-base.mailgun",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.MAILGUN_FROM_EMAIL }}",
+        "toEmail": "={{ $json.examinerEmail }}",
+        "subject": "Hasil Pertanyaan & Evaluasi: {{ $json.topic }}",
+        "html": "<h2>Hasil Pertanyaan & Evaluasi Bisnis</h2><p><strong>Topik:</strong> {{ $json.topic }}</p><p><strong>Industri:</strong> {{ $json.industry }}</p><p><strong>Tanggal:</strong> {{ $json.created_at }}</p><h3>Ringkasan Evaluasi</h3><ul><li>Total Pertanyaan: {{ $json.summary.totalQuestions }}</li><li>Skor Rata-rata: {{ $json.summary.averageScore }}/5</li><li>Kualitas: {{ $json.summary.quality }}</li><li>Industri: {{ $json.industry }}</li></ul><h3>Pertanyaan yang Dihasilkan</h3>{{ $json.questions }}<h3>Detail Evaluasi</h3>{{ $json.evaluations }}<hr><p><small>Dibuat oleh AI Question Generator Workflow</small></p>"
+      },
+      "credentials": {
+        "mailgunApi": {
+          "id": "mailgun-api-key",
+          "name": "Mailgun API credential"
+        }
+      }
+    },
+    {
+      "id": "respond-webhook-node",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        300
+      ],
+      "parameters": {
+        "responseBody": {
+          "status": "success",
+          "message": "Questions generated and evaluated successfully",
+          "data": {
+            "topic": "={{ $json.topic }}",
+            "industry": "={{ $json.industry }}",
+            "totalQuestions": "={{ $json.summary.totalQuestions }}",
+            "averageScore": "={{ $json.summary.averageScore }}",
+            "quality": "={{ $json.summary.quality }}",
+            "savedToDatabase": true,
+            "emailSent": true
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Model Manager",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Memory Manager",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AI Agent 1 - Question Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Manager": {
+      "main": [
+        [
+          {
+            "node": "AI Agent 1 - Question Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Memory Manager": {
+      "main": [
+        [
+          {
+            "node": "AI Agent 1 - Question Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent 1 - Question Generator": {
+      "main": [
+        [
+          {
+            "node": "AI Agent 2 - Question Evaluator",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Data Table - Save to Database",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent 2 - Question Evaluator": {
+      "main": [
+        [
+          {
+            "node": "Mailgun - Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mailgun - Send Email": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Table - Save to Database": {
+      "main": [
+        [
+          {
+            "node": "Mailgun - Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 1200,
+    "timezone": "Asia/Jakarta"
+  },
+  "id": "question-generator-workflow"
+}
