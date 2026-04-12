@@ -1,0 +1,11 @@
+{
+  "owner": "clawdbot",
+  "slug": "market-research",
+  "displayName": "Market Research",
+  "latest": {
+    "version": "1.0.1",
+    "publishedAt": 1712937600000,
+    "commit": "https://github.com/clawdbot/skills/market-research"
+  },
+  "history": []
+}
