@@ -7,5 +7,12 @@
     "publishedAt": 1712937600000,
     "commit": "https://github.com/clawdbot/skills/market-research"
   },
-  "history": []
+  "history": [],
+  "optimizedFor": ["openwebui", "open-terminal"],
+  "features": {
+    "market_sizing": true,
+    "competitor_analysis": true,
+    "customer_validation": true,
+    "terminal_research": true
+  }
 }
