@@ -1,0 +1,13 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "provider": {
+    "cloudflare": {
+      "options": {
+        "apiKey": "cfut_jncRGXOQsPRu9yf88fe4psRllsI3IZSDuLylKbjcff7395d0",
+        "accountId": "569a69ae3db60253f060ee8f8fec6f56",
+        "baseURL": "https://api.cloudflare.com/client/v4",
+        "timeout": 300000
+      }
+    }
+  }
+}

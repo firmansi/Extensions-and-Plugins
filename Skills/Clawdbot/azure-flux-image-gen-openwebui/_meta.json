@@ -1,0 +1,8 @@
+{
+  "slug": "azure-flux-image-gen-openwebui",
+  "version": "1.0.0",
+  "description": "FLUX.2-pro image generation adapted for Open WebUI and Open Terminal",
+  "publishedAt": 1754131405000,
+  "parent": "azure-flux-image-gen",
+  "platforms": ["openwebui", "open-terminal"]
+}
