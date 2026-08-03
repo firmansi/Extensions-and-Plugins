@@ -40,20 +40,6 @@ SequentialMode = Literal[
     "disabled",
 ]
 
-# BytePlus SeeDream models
-ModelType = Literal[
-    "seedream-4-5-251128",
-    "seedream-4-0-251128",
-    "seedream-3-0-t2i",
-]
-
-# Sequential generation mode
-SequentialMode = Literal[
-    "auto",
-    "disabled",
-]
-
-
 class Pipe:
     """Implements the Pipe class for Open WebUI with BytePlus SeeDream image generation and editing."""
 
@@ -94,6 +80,10 @@ class Pipe:
         response_format: str = Field(
             default="url",
             description="Response format: 'url' or 'b64_json'",
+        )
+        request_timeout: int = Field(
+            default=600,
+            description="Request timeout in seconds (minimum 600 for image generation)",
         )
 
     def __init__(self):
@@ -262,13 +252,13 @@ class Pipe:
                 f"DEBUG: Request payload: {json.dumps({k: v if k != 'image' else f'[{len(v)} images]' if isinstance(v, list) else '[1 image]' for k, v in payload.items()}, indent=2)}"
             )
 
-            # Make the API request
-            with httpx.Client(timeout=120) as client:
+            # Make the API request with configured timeout
+            with httpx.Client(timeout=self.valves.request_timeout) as client:
                 response = client.post(
                     f"{self.valves.base_url}/images/generations",
                     json=payload,
                     headers=headers,
-                    timeout=120,  # 120-second timeout for image generation
+                    timeout=self.valves.request_timeout,
                 )
 
             # Check if the request was successful
@@ -304,10 +294,14 @@ class Pipe:
                 else:
                     raise Exception(f"Unexpected response format: {result}")
 
+        except httpx.TimeoutException as e:
+            raise Exception(f"BytePlus API timeout error: Request took longer than {self.valves.request_timeout} seconds. Image generation may still be processing. Try increasing request_timeout in settings.")
         except httpx.HTTPStatusError as e:
             raise Exception(
                 f"BytePlus API error: {e.response.status_code} - {e.response.text}"
             )
+        except httpx.ConnectError as e:
+            raise Exception(f"BytePlus API connection error: Failed to connect to {self.valves.base_url}")
         except Exception as e:
             raise Exception(f"BytePlus API error: {str(e)}")
 
