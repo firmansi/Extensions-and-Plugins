@@ -1,0 +1,183 @@
+{
+  "name": "Delete Sync Nextcloud to Qdrant",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger-01",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "operation": "list",
+        "path": "/RAG_Data_Matasigma"
+      },
+      "id": "list-folder-01",
+      "name": "List Current Files",
+      "type": "n8n-nodes-base.nextCloud",
+      "typeVersion": 1,
+      "position": [
+        450,
+        300
+      ],
+      "credentials": {
+        "nextCloudApi": {
+          "id": "ooXrN7KoOAWABLw5",
+          "name": "Work Matasigma Firman"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get current files from Nextcloud\nconst currentFiles = $input.all()[0].json.filter(item => item.type !== 'directory').map(f => decodeURIComponent(f.path));\n\n// Get all points from Qdrant collection\n// This will be replaced by actual Qdrant query in next node\nreturn [{\n  json: {\n    currentFiles: currentFiles,\n    message: 'Files listed'\n  }\n}];"
+      },
+      "id": "code-process-01",
+      "name": "Process File List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "point",
+        "operation": "scrollPoints",
+        "collectionName": "work_matasigma_documents",
+        "limit": 1000,
+        "withPayload": true,
+        "withVector": false
+      },
+      "id": "qdrant-list-01",
+      "name": "Get All Qdrant Points",
+      "type": "n8n-nodes-qdrant.qdrant",
+      "typeVersion": 1,
+      "position": [
+        700,
+        500
+      ],
+      "credentials": {
+        "qdrantApi": {
+          "id": "wdZRlUkXMvteWWmP",
+          "name": "Qdrant Matasigma"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get current files from Nextcloud (from previous node)\nconst currentFiles = $input.all()[0].json.currentFiles || [];\n\n// Get all points from Qdrant\nconst qdrantPoints = $input.all()[1]?.json?.result?.points || [];\n\n// Extract file paths from Qdrant payload metadata\nconst qdrantFiles = qdrantPoints.map(p => {\n  // Payload structure depends on how files were inserted\n  // Usually metadata contains file path\n  const metadata = p.payload?.metadata || {};\n  return metadata.source || metadata.path || p.id;\n}).filter(Boolean);\n\n// Find files in Qdrant that don't exist in Nextcloud\nconst filesToDelete = qdrantFiles.filter(qf => !currentFiles.includes(qf));\n\nreturn filesToDelete.map(filePath => ({\n  json: {\n    filePath: filePath,\n    pointId: filePath\n  }\n}));"
+      },
+      "id": "code-compare-01",
+      "name": "Find Deleted Files",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        950,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "point",
+        "operation": "deletePoints",
+        "collectionName": "work_matasigma_documents",
+        "points": "={{ [$json.pointId] }}"
+      },
+      "id": "qdrant-delete-01",
+      "name": "Delete from Qdrant",
+      "type": "n8n-nodes-qdrant.qdrant",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        400
+      ],
+      "credentials": {
+        "qdrantApi": {
+          "id": "wdZRlUkXMvteWWmP",
+          "name": "Qdrant Matasigma"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "List Current Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Current Files": {
+      "main": [
+        [
+          {
+            "node": "Process File List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process File List": {
+      "main": [
+        [
+          {
+            "node": "Find Deleted Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Qdrant Points": {
+      "main": [
+        [
+          {
+            "node": "Find Deleted Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Deleted Files": {
+      "main": [
+        [
+          {
+            "node": "Delete from Qdrant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "timezone": "Asia/Jakarta"
+  },
+  "tags": []
+}

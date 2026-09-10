@@ -18,7 +18,7 @@ from typing import AsyncGenerator, List, Dict, Any, Literal, Optional, Union
 from pydantic import BaseModel, Field
 from fastapi import Request
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError
 
 # Image size options based on BytePlus API documentation
 ImageSizeType = Literal[
@@ -90,6 +90,10 @@ class Pipe:
         strength: float = Field(
             default=1.0,
             description="Strength parameter for image editing (0.0-2.0)",
+        )
+        request_timeout: int = Field(
+            default=600,
+            description="Request timeout in seconds (minimum 600 for image generation)",
         )
 
     def __init__(self):
@@ -211,10 +215,11 @@ class Pipe:
         :return: URL of the generated image or base64 data
         """
         try:
-            # Initialize OpenAI client with BytePlus endpoint
+            # Initialize OpenAI client with BytePlus endpoint and timeout
             client = OpenAI(
                 base_url=self.valves.base_url,
                 api_key=self.valves.api_key,
+                timeout=self.valves.request_timeout,
             )
 
             # Prepare extra_body parameters
@@ -294,6 +299,10 @@ class Pipe:
                 # For b64_json format
                 return f"data:image/jpeg;base64,{images_response.data[0].b64_json}"
 
+        except APITimeoutError as e:
+            raise Exception(f"BytePlus API timeout error: Request took longer than {self.valves.request_timeout} seconds. Image generation may still be processing. Try increasing request_timeout in settings.")
+        except APIConnectionError as e:
+            raise Exception(f"BytePlus API connection error: {str(e)}")
         except Exception as e:
             raise Exception(f"BytePlus API error: {str(e)}")
 
@@ -313,10 +322,11 @@ class Pipe:
         :return: URL of the generated image or base64 data
         """
         try:
-            # Initialize OpenAI client with BytePlus endpoint (using the configured base URL)
+            # Initialize OpenAI client with BytePlus endpoint and timeout
             client = OpenAI(
-                base_url=self.valves.base_url,  # Use the configured base URL
+                base_url=self.valves.base_url,
                 api_key=self.valves.api_key,
+                timeout=self.valves.request_timeout,
             )
 
             # Prepare the extra_body with multiple reference images
@@ -361,53 +371,10 @@ class Pipe:
                 # For b64_json format
                 return f"data:image/jpeg;base64,{images_response.data[0].b64_json}"
 
-        except Exception as e:
-            raise Exception(
-                f"BytePlus API error in reference-based generation: {str(e)}"
-            )
-
-            # Prepare the extra_body with multiple reference images
-            # Handle both base64 encoded images and URLs
-            processed_images = []
-            for img in reference_images:
-                if img.startswith("data:image"):
-                    # If it's a base64 data URL, it can be passed directly
-                    processed_images.append(img)
-                else:
-                    # If it's already a URL, pass it as is
-                    processed_images.append(img)
-
-            extra_body = {
-                "image": processed_images,  # Pass the list of reference images
-                "watermark": self.valves.watermark,  # Use configured watermark setting
-                "sequential_image_generation": "disabled",  # Disable sequential generation
-            }
-
-            # Add seed if not random
-            if self.valves.seed != -1:
-                extra_body["seed"] = self.valves.seed
-
-            print(
-                f"DEBUG: Generating image from {len(processed_images)} reference images with prompt: '{prompt}'"
-            )
-            print(f"DEBUG: Reference images: {processed_images}")
-
-            # Generate image using multiple reference images
-            images_response = client.images.generate(
-                model=self.valves.model_name,  # Use the configured model name
-                prompt=prompt,
-                size=size,
-                response_format=self.valves.response_format,  # Use configured response format
-                extra_body=extra_body,
-            )
-
-            # Return URL or base64 based on response format
-            if self.valves.response_format == "url":
-                return images_response.data[0].url
-            else:
-                # For b64_json format
-                return f"data:image/jpeg;base64,{images_response.data[0].b64_json}"
-
+        except APITimeoutError as e:
+            raise Exception(f"BytePlus API timeout error: Request took longer than {self.valves.request_timeout} seconds. Image generation may still be processing. Try increasing request_timeout in settings.")
+        except APIConnectionError as e:
+            raise Exception(f"BytePlus API connection error: {str(e)}")
         except Exception as e:
             raise Exception(
                 f"BytePlus API error in reference-based generation: {str(e)}"

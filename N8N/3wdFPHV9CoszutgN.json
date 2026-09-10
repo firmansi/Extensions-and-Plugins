@@ -1,0 +1,393 @@
+{
+    "updatedAt": "2026-04-21T18:47:18+07:00",
+    "createdAt": "2026-04-19T15:47:46.673Z",
+    "id": "3wdFPHV9CoszutgN",
+    "name": "Create notes and comments on any Odoo model record",
+    "description": "Automated workflow that searches for contact by name and creates notes on the appropriate model",
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "workflowInputs": {
+            "values": [
+              {
+                "name": "contact_name",
+                "type": "string"
+              },
+              {
+                "name": "message"
+              }
+            ]
+          }
+        },
+        "id": "aec2c855-0861-4757-a43e-2729d63973ea",
+        "name": "When Executed by Another Workflow",
+        "type": "n8n-nodes-base.executeWorkflowTrigger",
+        "position": [
+          960,
+          304
+        ],
+        "typeVersion": 1.1
+      },
+      {
+        "parameters": {
+          "resource": "res.partner",
+          "operation": "getAll",
+          "filters": [
+            {
+              "operator": "ilike",
+              "value": "={{ $json.contact_name }}",
+              "fieldName": "display_name"
+            }
+          ]
+        },
+        "id": "search-contact",
+        "name": "Search Contact",
+        "type": "n8n-nodes-base.odoo",
+        "position": [
+          1168,
+          200
+        ],
+        "typeVersion": 1,
+        "credentials": {
+          "odooApi": {
+            "id": "I6NMKhBW7ip7coPe",
+            "name": "Odoo Matasigma"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{ Array.isArray($input.all()) && $input.all().length > 0 }}",
+                "operation": "equal",
+                "value2": true
+              }
+            ]
+          }
+        },
+        "id": "check-results",
+        "name": "Check Results",
+        "type": "n8n-nodes-base.if",
+        "position": [
+          1168,
+          340
+        ],
+        "typeVersion": 2
+      },
+      {
+        "parameters": {
+          "resource": "custom",
+          "customResource": "mail.message",
+          "fieldsToCreateOrUpdate": {
+            "fields": [
+              {
+                "fieldName": "message_type",
+                "fieldValue": "comment"
+              },
+              {
+                "fieldName": "model",
+                "fieldValue": "={{ $input.first().json[0]['model'] || 'res.partner' }}"
+              },
+              {
+                "fieldName": "res_id",
+                "fieldValue": "={{ $input.first().json[0]['id'] }}"
+              },
+              {
+                "fieldName": "body",
+                "fieldValue": "={{ $('When Executed by Another Workflow').item.json.message }}"
+              }
+            ]
+          }
+        },
+        "id": "create-note",
+        "name": "Create Note",
+        "type": "n8n-nodes-base.odoo",
+        "position": [
+          1424,
+          200
+        ],
+        "typeVersion": 1,
+        "credentials": {
+          "odooApi": {
+            "id": "I6NMKhBW7ip7coPe",
+            "name": "Odoo Matasigma"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "content": "## Creates a Note in an Odoo Record\\nThis sub-workflow receives a contact name and message, searches for the contact, and creates a note on the appropriate model",
+          "height": 260,
+          "width": 400,
+          "color": 6
+        },
+        "id": "b5c95ef2-66a7-4706-9ffb-9359133c889e",
+        "name": "Sticky Note",
+        "type": "n8n-nodes-base.stickyNote",
+        "position": [
+          368,
+          240
+        ],
+        "typeVersion": 1
+      }
+    ],
+    "connections": {
+      "When Executed by Another Workflow": {
+        "main": [
+          [
+            {
+              "node": "Search Contact",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Search Contact": {
+        "main": [
+          [
+            {
+              "node": "Check Results",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Results": {
+        "main": [
+          [
+            {
+              "node": "Create Note",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          []
+        ]
+      }
+    },
+    "settings": {
+      "availableInMCP": false,
+      "executionOrder": "v1",
+      "binaryMode": "separate"
+    },
+    "staticData": null,
+    "meta": {
+      "templateId": "3282"
+    },
+    "pinData": {},
+    "versionId": "91ba505f-26d8-4c87-b281-484c48b87ac8",
+    "activeVersionId": "1db3c6f0-4444-45c6-94a1-b24fa7f0c89f",
+    "versionCounter": 12,
+    "triggerCount": 0,
+    "shared": [
+      {
+        "updatedAt": "2026-04-19T15:47:46.673Z",
+        "createdAt": "2026-04-19T15:47:46.673Z",
+        "role": "workflow:owner",
+        "workflowId": "3wdFPHV9CoszutgN",
+        "projectId": "LPVeOPDwulch8FGd",
+        "project": {
+          "updatedAt": "2024-06-11T01:38:06.329Z",
+          "createdAt": "2024-06-11T01:38:06.329Z",
+          "id": "LPVeOPDwulch8FGd",
+          "name": "Firman Siahaan <firman@telecious.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "creatorId": "0ddacc77-05fc-4202-a8f1-3b5112056045"
+        }
+      }
+    ],
+    "tags": [],
+    "activeVersion": {
+      "updatedAt": "2026-04-21T18:47:18.521Z",
+      "createdAt": "2026-04-19T15:47:46.673Z",
+      "versionId": "1db3c6f0-4444-45c6-94a1-b24fa7f0c89f",
+      "workflowId": "3wdFPHV9CoszutgN",
+      "nodes": [
+        {
+          "id": "aec2c855-0861-4757-a43e-2729d63973ea",
+          "name": "When Executed by Another Workflow",
+          "type": "n8n-nodes-base.executeWorkflowTrigger",
+          "position": [
+            948,
+            300
+          ],
+          "parameters": {
+            "workflowInputs": {
+              "values": [
+                {
+                  "name": "contact_name",
+                  "type": "string"
+                },
+                {
+                  "name": "message"
+                }
+              ]
+            }
+          },
+          "typeVersion": 1.1
+        },
+        {
+          "id": "search-contact",
+          "name": "Search Contact",
+          "type": "n8n-nodes-base.odoo",
+          "position": [
+            1168,
+            200
+          ],
+          "typeVersion": 1,
+          "credentials": {
+            "odooApi": {
+              "id": "I6NMKhBW7ip7coPe",
+              "name": "Odoo Matasigma"
+            }
+          },
+          "parameters": {
+            "resource": "res.partner",
+            "operation": "getAll",
+            "filters": [
+              {
+                "operator": "ilike",
+                "value": "={{ $json.contact_name }}",
+                "fieldName": "display_name"
+              }
+            ]
+          }
+        },
+        {
+          "id": "check-results",
+          "name": "Check Results",
+          "type": "n8n-nodes-base.if",
+          "position": [
+            1168,
+            340
+          ],
+          "typeVersion": 2,
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{ Array.isArray($input.all()) && $input.all().length > 0 }}",
+                  "operation": "equal",
+                  "value2": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "create-note",
+          "name": "Create Note",
+          "type": "n8n-nodes-base.odoo",
+          "position": [
+            1424,
+            200
+          ],
+          "typeVersion": 1,
+          "credentials": {
+            "odooApi": {
+              "id": "I6NMKhBW7ip7coPe",
+              "name": "Odoo Matasigma"
+            }
+          },
+          "parameters": {
+            "resource": "custom",
+            "customResource": "mail.message",
+            "fieldsToCreateOrUpdate": {
+              "fields": [
+                {
+                  "fieldName": "message_type",
+                  "fieldValue": "comment"
+                },
+                {
+                  "fieldName": "model",
+                  "fieldValue": "={{ $input.first().json[0]['model'] || 'res.partner' }}"
+                },
+                {
+                  "fieldName": "res_id",
+                  "fieldValue": "={{ $input.first().json[0]['id'] }}"
+                },
+                {
+                  "fieldName": "body",
+                  "fieldValue": "={{ $('When Executed by Another Workflow').item.json.message }}"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "connections": {
+        "When Executed by Another Workflow": {
+          "main": [
+            [
+              {
+                "node": "Search Contact",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Search Contact": {
+          "main": [
+            [
+              {
+                "node": "Check Results",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Check Results": {
+          "main": [
+            [
+              {
+                "node": "Create Note",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            []
+          ]
+        }
+      },
+      "authors": "Firman Siahaan",
+      "name": "Version 1db3c6f0",
+      "description": "Automated workflow that searches for contact by name and creates notes on the appropriate model",
+      "autosaved": false,
+      "workflowPublishHistory": [
+        {
+          "createdAt": "2026-04-21T18:47:18.519Z",
+          "id": 721,
+          "workflowId": "3wdFPHV9CoszutgN",
+          "versionId": "1db3c6f0-4444-45c6-94a1-b24fa7f0c89f",
+          "event": "activated",
+          "userId": "0ddacc77-05fc-4202-a8f1-3b5112056045"
+        },
+        {
+          "createdAt": "2026-04-21T18:47:18.520Z",
+          "id": 722,
+          "workflowId": "3wdFPHV9CoszutgN",
+          "versionId": "1db3c6f0-4444-45c6-94a1-b24fa7f0c89f",
+          "event": "deactivated",
+          "userId": "0ddacc77-05fc-4202-a8f1-3b5112056045"
+        },
+        {
+          "createdAt": "2026-04-21T18:47:18.521Z",
+          "id": 723,
+          "workflowId": "3wdFPHV9CoszutgN",
+          "versionId": "1db3c6f0-4444-45c6-94a1-b24fa7f0c89f",
+          "event": "activated",
+          "userId": "0ddacc77-05fc-4202-a8f1-3b5112056045"
+        }
+      ]
+    }
+  }

@@ -1,0 +1,427 @@
+{
+  "name": "Upload Work Matasigma to Vector Storage Qdrant",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "id": "12a1e907-9625-4d1c-b78f-840e276c7d88",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        1040,
+        496
+      ],
+      "typeVersion": 1.3
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "operation": "list",
+        "path": "/RAG_Data_Matasigma"
+      },
+      "id": "59e79b86-dd15-4aeb-9d3f-f86fb80de71a",
+      "name": "List a folder",
+      "type": "n8n-nodes-base.nextCloud",
+      "position": [
+        1280,
+        496
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "nextCloudApi": {
+          "id": "ooXrN7KoOAWABLw5",
+          "name": "Work Matasigma Firman"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "path": "={{ '/' + $json.path }}"
+      },
+      "id": "5822ef39-9919-4863-8129-c14c37d14549",
+      "name": "Download a file",
+      "type": "n8n-nodes-base.nextCloud",
+      "position": [
+        1728,
+        496
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "nextCloudApi": {
+          "id": "ooXrN7KoOAWABLw5",
+          "name": "Work Matasigma Firman"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "##  Sovereign AI Document Summarizer\n### Nextcloud + IONOS AI Model Hub\n\nThis workflow automates document summarization while keeping full digital sovereignty. By combining Nextcloud for file storage and the IONOS AI Model Hub, your sensitive documents stay on European infrastructure.\n\n**Requirements checklist:**\n- [ ] Nextcloud OAuth2 credentials configured (read + write)\n- [ ] IONOS Cloud API token added to credentials\n- [ ] `@ionos-cloud/n8n-nodes-ionos-cloud` node package installed\n- [ ] LangChain AI nodes enabled (`@n8n/n8n-nodes-langchain`)\n- [ ] `/Notes/` folder created in your Nextcloud instance\n- [ ] Folder path set in the **List a folder** node\n\n**Data flow:**\nSchedule → List Folder → Filter → Download → Summarize → Upload Summary",
+        "height": 544,
+        "width": 512
+      },
+      "id": "7f0e174f-8c8b-4196-9311-040941ffd55a",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        368,
+        240
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## 1. Process all files (update if exists)\n",
+        "height": 368,
+        "width": 832
+      },
+      "id": "0e970be6-5a11-4dbd-b60b-f83d5d3d8cfc",
+      "name": "Sticky Note1",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1008,
+        384
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter directories and preserve basename\nconst files = $input.all().filter(item => item.json.type !== 'directory');\nreturn files.map(item => ({\n  json: {\n    path: item.json.path,\n    basename: item.json.basename\n  }\n}));"
+      },
+      "id": "preserve-filename-001",
+      "name": "Preserve Filename",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Check if file exists in Qdrant, delete if yes, then insert\n",
+        "height": 672,
+        "width": 624
+      },
+      "id": "ac728383-ce00-42d0-b993-628fd53d8453",
+      "name": "Sticky Note2",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1856,
+        368
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://qdrant.mpconsulting.cloud/collections/work_matasigma_documents/points/scroll' }}",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "api-key",
+              "value": "={{ $credentials.qdrantApiKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "filter",
+              "value": "={{ { \"must\": [{ \"key\": \"metadata.filename\", \"match\": { \"value\": $json.basename } }] } } }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "check-existing-001",
+      "name": "Check Existing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1904,
+        496
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "qdrant-auth",
+          "name": "Qdrant API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if file exists in Qdrant via HTTP API\nconst response = $input.first().json;\nconst currentFile = $thisItem.json;\n\n// Qdrant scroll returns { result: { points: [...] } }\nconst points = response?.result?.points || [];\n\nif (points.length > 0) {\n  const existingDoc = points[0];\n  const pointId = existingDoc.id;\n  \n  return {\n    json: {\n      action: 'delete_and_insert',\n      filename: currentFile.basename,\n      pointId: pointId,\n      basename: currentFile.basename\n    }\n  };\n} else {\n  return {\n    json: {\n      action: 'insert_only',\n      filename: currentFile.basename,\n      basename: currentFile.basename\n    }\n  };\n}"
+      },
+      "id": "decide-action-001",
+      "name": "Decide Action",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2128,
+        496
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://qdrant.mpconsulting.cloud/collections/work_matasigma_documents/points/delete' }}",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "api-key",
+              "value": "={{ $credentials.qdrantApiKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "points",
+              "value": "={{ [$json.pointId] }}"
+            }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "id": "delete-old-001",
+      "name": "Delete Old Document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2368,
+        368
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "qdrant-auth",
+          "name": "Qdrant API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 3. Upsert to Qdrant (update if exists)\n",
+        "height": 368,
+        "width": 624
+      },
+      "id": "d05aa008-8ede-4e6c-87ed-0a0bda31df43",
+      "name": "Sticky Note3",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2512,
+        384
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "qdrantCollection": {
+          "__rl": true,
+          "value": "work_matasigma_documents ",
+          "mode": "list",
+          "cachedResultName": "work_matasigma_documents "
+        },
+        "options": {
+          "metadataPayloadKey": "metadata"
+        }
+      },
+      "id": "milvus-insert-001",
+      "name": "Insert to Qdrant",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+      "typeVersion": 1.3,
+      "position": [
+        2032,
+        480
+      ],
+      "credentials": {
+        "qdrantApi": {
+          "id": "wdZRlUkXMvteWWmP",
+          "name": "Qdrant Matasigma"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1904,
+        704
+      ],
+      "id": "5f0d3a5d-96aa-4c36-8601-46159a3e53a3",
+      "name": "Embeddings Google Gemini",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "uQV7Mc6E66sfHywl",
+          "name": "Google Gemini MP Consulting"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        2128,
+        704
+      ],
+      "id": "68a2442d-b3d9-4584-85fe-2aebbf4bbcdb",
+      "name": "Default Data Loader1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "List a folder": {
+      "main": [
+        [
+          {
+            "node": "Preserve Filename",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preserve Filename": {
+      "main": [
+        [
+          {
+            "node": "Download a file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download a file": {
+      "main": [
+        [
+          {
+            "node": "Check Existing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Existing": {
+      "main": [
+        [
+          {
+            "node": "Decide Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Action": {
+      "main": [
+        [
+          {
+            "node": "Delete Old Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert to Qdrant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Old Document": {
+      "main": [
+        [
+          {
+            "node": "Insert to Qdrant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "List a folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Insert to Qdrant",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Default Data Loader1": {
+      "ai_document": [
+        [
+          {
+            "node": "Insert to Qdrant",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Asia/Jakarta"
+  },
+  "versionId": "5c2f7bef-f945-42f2-acb3-48bdfc8382f3",
+  "meta": {
+    "templateId": "14544",
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c79c03fad392552e62c65d0138bb12c206cf345e39be16c1e723edcd068c0144"
+  },
+  "id": "19oGrZWQ76Ajt4Vc",
+  "tags": []
+}
