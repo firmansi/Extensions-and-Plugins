@@ -4,10 +4,10 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.16.0
+version: 1.16.2
 required_open_webui_version: 0.11.0
 license: Apache License 2.0
-description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows. (Updated for OpenWebUI 0.11.0 + Native Server-Side Tool Calling)
+description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows. (Updated for OpenWebUI 0.11.0 + Native Server-Side Tool Calling & Gemini 3.x Fixes)
 """
 
 import os
@@ -88,7 +88,6 @@ VIDEO_PERSON_GENERATION_OPTIONS: List[str] = [
 ]
 
 
-# Simplified encryption implementation with automatic handling
 class EncryptedStr(str):
     """A string type that automatically handles encryption/decryption"""
 
@@ -198,8 +197,8 @@ class Pipe:
             json_schema_extra={"input": {"type": "password"}},
         )
         API_VERSION: str = Field(
-            default=os.getenv("GOOGLE_API_VERSION", "v1alpha"),
-            description="API version to use for Google Generative AI (e.g., v1alpha, v1beta, v1).",
+            default=os.getenv("GOOGLE_API_VERSION", "v1beta"),
+            description="API version to use for Google Generative AI (e.g., v1beta, v1).",
         )
         STREAMING_ENABLED: bool = Field(
             default=os.getenv("GOOGLE_STREAMING_ENABLED", "true").lower() == "true",
@@ -749,6 +748,8 @@ class Pipe:
             "gemini-3.1-flash-image-preview",
             "gemini-3.1-flash-image",
             "gemini-3.1-flash-image-lite",
+            "gemini-3.7-flash-image",
+            "gemini-3.7-flash-image-preview",
             "gemini-3-pro-image",
             "gemini-3-pro-image-preview",
         ]
@@ -757,17 +758,19 @@ class Pipe:
             if model_id == pattern or pattern in model_id:
                 return True
 
-        # Relaxed regex for better model catching
         if "image" in model_id.lower():
             return True
 
         return False
 
     def _is_gemini_3_family_model(self, model_id: str) -> bool:
+        """Detect any Gemini 3.x model, including 3, 3.1, 3.5, 3.7, etc."""
         model_lower = model_id.lower()
-        return model_lower.startswith("gemini-3-") or model_lower.startswith(
-            "gemini-3."
-        )
+        if model_lower.startswith("gemini-3-"):
+            return True
+        if model_lower.startswith("gemini-3."):
+            return True
+        return bool(re.search(r"\bgemini-3(?:\.\d+)?-", model_lower))
 
     def _is_gemini_3_image_model(self, model_id: str) -> bool:
         return self._is_gemini_3_family_model(
@@ -801,7 +804,9 @@ class Pipe:
 
     def _get_supported_thinking_levels(self, model_id: str) -> List[str]:
         model_lower = model_id.lower()
-        if model_lower.startswith("gemini-3.1-flash-image"):
+        if model_lower.startswith("gemini-3.1-flash-image") or model_lower.startswith(
+            "gemini-3.7-flash-image"
+        ):
             return ["minimal", "high"]
         if self._is_gemini_3_family_model(model_id):
             return ["low", "high"]
@@ -1905,14 +1910,47 @@ class Pipe:
                     )
                 )
 
-        # UPDATED for OpenWebUI 0.11.0: Combine native __tools__, body["tools"], and inline features
         function_declarations: List[types.FunctionDeclaration] = []
         native_tool_specs: Dict[str, Any] = {}
 
-        # 1) Native OpenWebUI tools passed via __tools__ (server-side callable tools)
+        def _clean_tool_schema(schema: Any) -> Any:
+            if isinstance(schema, dict):
+                allowed_keys = {
+                    "type",
+                    "description",
+                    "properties",
+                    "required",
+                    "items",
+                    "enum",
+                }
+                cleaned = {}
+                for k, v in schema.items():
+                    if k not in allowed_keys:
+                        continue
+                    cleaned[k] = _clean_tool_schema(v)
+
+                properties = cleaned.get("properties")
+                required = cleaned.get("required")
+                if isinstance(properties, dict) and isinstance(required, list):
+                    cleaned["required"] = [r for r in required if r in properties]
+                return cleaned
+            if isinstance(schema, list):
+                return [_clean_tool_schema(v) for v in schema]
+            return schema
+
         if __tools__ and self.valves.NATIVE_TOOL_CALLING_ENABLED:
-            for tool in __tools__:
-                spec = getattr(tool, "spec", None)
+            # FIX: OpenWebUI mengirimkan __tools__ sebagai DICT {tool_id: {"spec": ..., "callable": ...}}
+            # bukan list objek. Iterasi .values() agar mendapatkan tool sebenarnya.
+            tools_iterable = (
+                __tools__.values() if isinstance(__tools__, dict) else __tools__
+            )
+            for tool in tools_iterable:
+                # FIX: tool bisa berupa dict (OpenWebUI) atau objek dengan atribut .spec
+                spec = (
+                    tool.get("spec")
+                    if isinstance(tool, dict)
+                    else getattr(tool, "spec", None)
+                )
                 if not spec:
                     continue
                 name = spec.get("name")
@@ -1921,7 +1959,10 @@ class Pipe:
                 if enable_image_generation and self._is_open_webui_image_tool(name):
                     continue
                 try:
-                    parameters = spec.get("parameters") or spec.get("parameters_schema") or {}
+                    parameters = (
+                        spec.get("parameters") or spec.get("parameters_schema") or {}
+                    )
+                    parameters = _clean_tool_schema(parameters)
                     function_declarations.append(
                         types.FunctionDeclaration(
                             name=name,
@@ -1933,7 +1974,6 @@ class Pipe:
                 except Exception:
                     continue
 
-        # 2) OpenAI-style tools array from the request body (fallback / additional)
         if "tools" in body and isinstance(body.get("tools"), list):
             for tool in body["tools"]:
                 if tool.get("type") == "function":
@@ -1943,21 +1983,86 @@ class Pipe:
                         continue
                     if enable_image_generation and self._is_open_webui_image_tool(name):
                         continue
+                    parameters = func_data.get("parameters")
+                    parameters = _clean_tool_schema(parameters) if parameters else None
                     function_declarations.append(
                         types.FunctionDeclaration(
                             name=name,
                             description=func_data.get("description", ""),
-                            parameters=func_data.get("parameters"),
+                            parameters=parameters,
                         )
                     )
+                    # FIX: Mode native OpenWebUI meneruskan spec tool via body["tools"],
+                    # sedangkan callable-nya hanya tersedia di __tools__.
+                    # Tautkan keduanya berdasarkan nama agar tool loop bisa mengeksekusinya.
+                    if __tools__:
+                        candidate_tools = (
+                            __tools__.values()
+                            if isinstance(__tools__, dict)
+                            else __tools__
+                        )
+                        for candidate_tool in candidate_tools:
+                            candidate_spec = (
+                                candidate_tool.get("spec")
+                                if isinstance(candidate_tool, dict)
+                                else getattr(candidate_tool, "spec", None)
+                            )
+                            if candidate_spec and candidate_spec.get("name") == name:
+                                native_tool_specs[name] = candidate_tool
+                                break
 
         if function_declarations:
-            tools.append(types.Tool(function_declarations=function_declarations))
+            cleaned_declarations = []
+            for fd in function_declarations:
+                try:
+                    fd_dict = fd.model_dump(exclude_none=True)
+                except AttributeError:
+                    try:
+                        fd_dict = fd.dict(exclude_none=True)
+                    except AttributeError:
+                        fd_dict = {
+                            "name": getattr(fd, "name", ""),
+                            "description": getattr(fd, "description", ""),
+                            "parameters": getattr(fd, "parameters", None),
+                        }
+
+                def _clean_decl_schema(obj: Any) -> Any:
+                    if isinstance(obj, dict):
+                        out = {}
+                        for k, v in obj.items():
+                            if k in (
+                                "additional_properties",
+                                "additionalProperties",
+                                "examples",
+                                "$schema",
+                                "default",
+                                "title",
+                            ):
+                                continue
+                            out[k] = _clean_decl_schema(v)
+                        if "properties" in out and "required" in out:
+                            props = out.get("properties")
+                            req = out.get("required")
+                            if isinstance(props, dict) and isinstance(req, list):
+                                out["required"] = [r for r in req if r in props]
+                        return out
+                    if isinstance(obj, list):
+                        return [_clean_decl_schema(v) for v in obj]
+                    return obj
+
+                params = fd_dict.get("parameters")
+                if params:
+                    fd_dict["parameters"] = _clean_decl_schema(params)
+                cleaned_declarations.append(types.FunctionDeclaration(**fd_dict))
+
+            tools.append(types.Tool(function_declarations=cleaned_declarations))
+            self.log.debug(
+                f"Registered {len(cleaned_declarations)} function declaration(s)"
+            )
 
         if tools:
             gen_config_params["tools"] = tools
 
-        # Store native tool specs on the config instance so the pipe can use them later
         gen_config = types.GenerateContentConfig(
             **{k: v for k, v in gen_config_params.items() if v is not None}
         )
@@ -2003,10 +2108,6 @@ class Pipe:
                 )
         return formatted_sources
 
-    # ------------------------------------------------------------------
-    # OpenWebUI 0.11.0 Native Tool Calling Helpers
-    # ------------------------------------------------------------------
-
     def _get_native_tools_from_config(
         self, generation_config: types.GenerateContentConfig
     ) -> Dict[str, Any]:
@@ -2018,7 +2119,22 @@ class Pipe:
         """Best-effort serialize a tool result so Gemini can consume it."""
         if result is None:
             return {"result": None}
-        if isinstance(result, (str, int, float, bool, list, dict)):
+        if isinstance(result, bool):
+            return {"result": result}
+        if isinstance(result, (int, float)):
+            return {"result": result}
+        # FIX: string mungkin berupa JSON hasil tool OpenWebUI — coba parse ke dict/list.
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                parsed = result
+            if isinstance(parsed, dict):
+                return parsed
+            return {"result": parsed}
+        if isinstance(result, list):
+            return {"result": result}
+        if isinstance(result, dict):
             return result
         if hasattr(result, "model_dump"):
             return result.model_dump()
@@ -2035,6 +2151,7 @@ class Pipe:
         args: Dict[str, Any],
         native_tools: Dict[str, Any],
         __event_emitter__: Callable,
+        tool_call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute a single native OpenWebUI tool by name and return a Gemini FunctionResponse."""
         tool = native_tools.get(tool_name)
@@ -2044,20 +2161,26 @@ class Pipe:
                 "response": {
                     "error": f"Native tool '{tool_name}' is not available in this session."
                 },
+                "id": tool_call_id,
             }
 
-        callable_ref = getattr(tool, "callable", None)
+        # FIX: tool bisa berupa dict (OpenWebUI: {"spec":..., "callable":...}) atau objek
+        callable_ref = (
+            tool.get("callable")
+            if isinstance(tool, dict)
+            else getattr(tool, "callable", None)
+        )
         if not callable_ref:
             return {
                 "name": tool_name,
                 "response": {
                     "error": f"Native tool '{tool_name}' does not expose a callable."
                 },
+                "id": tool_call_id,
             }
 
         try:
-            # OpenWebUI 0.11.0 may pass async callables as bound partials/methods.
-            # Prefer an explicit async test; fall back to calling and awaiting if coroutine.
+
             async def _invoke(fn, params):
                 if inspect.iscoroutinefunction(fn) or asyncio.iscoroutinefunction(fn):
                     return await fn(params)
@@ -2067,23 +2190,91 @@ class Pipe:
                 return maybe_coro
 
             try:
-                result = await _invoke(callable_ref, args)
+                # FIX: Konvensi OpenWebUI — tool dipanggil dengan keyword arguments,
+                # jadi coba **args terlebih dahulu, fallback ke positional dict.
+                result = await _invoke(callable_ref, **args)
             except TypeError as te:
-                # Some OWUI tools expect keyword arguments instead of a single dict
                 try:
-                    result = await _invoke(callable_ref, **args)
+                    result = await _invoke(callable_ref, args)
                 except Exception:
                     raise te
         except Exception as e:
             return {
                 "name": tool_name,
                 "response": {"error": f"Tool execution failed: {e}"},
+                "id": tool_call_id,
             }
 
         return {
             "name": tool_name,
             "response": self._serialize_tool_result(result),
+            "id": tool_call_id,
         }
+
+    @staticmethod
+    def _normalize_function_args(args: Any) -> Dict[str, Any]:
+        if args is None:
+            return {}
+        if isinstance(args, dict):
+            return dict(args)
+        if hasattr(args, "to_json_dict"):
+            try:
+                return dict(args.to_json_dict())
+            except Exception:
+                pass
+        if hasattr(args, "fields") and isinstance(args.fields, dict):
+            try:
+                return {
+                    k: Pipe._normalize_function_args(v) for k, v in args.fields.items()
+                }
+            except Exception:
+                pass
+        if hasattr(args, "items") and callable(getattr(args, "items", None)):
+            try:
+                return {k: Pipe._normalize_function_args(v) for k, v in args.items()}
+            except Exception:
+                pass
+        if hasattr(args, "__iter__") and not isinstance(args, (str, bytes)):
+            try:
+                result = {}
+                for key in args:
+                    result[key] = Pipe._normalize_function_args(
+                        getattr(args, key, None)
+                    )
+                return result
+            except Exception:
+                pass
+        try:
+            return json.loads(json.dumps(args, default=str))
+        except Exception:
+            return {"args": str(args)}
+
+    @staticmethod
+    def _build_function_call_part_with_signature(
+        name: str,
+        args: Any,
+        signature: Optional[Any] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> types.Part:
+        normalized_args = Pipe._normalize_function_args(args)
+        try:
+            fc = types.FunctionCall(name=name, args=normalized_args)
+        except Exception:
+            fc = types.FunctionCall()
+            fc.name = name
+            fc.args = normalized_args
+
+        part = types.Part()
+        part.function_call = fc
+        if signature:
+            part.thought_signature = signature
+        if tool_call_id:
+            try:
+                part.function_call.id = tool_call_id
+            except Exception:
+                pass
+
+        return part
 
     async def _run_tool_loop(
         self,
@@ -2097,7 +2288,6 @@ class Pipe:
     ) -> Tuple[types.GenerateContentResponse, int]:
         """
         Run a Gemini function-calling loop using native OpenWebUI tools.
-        Returns the final model response and the number of tool turns executed.
         """
         tool_iterations = 0
         current_config = generation_config
@@ -2115,12 +2305,33 @@ class Pipe:
             if not candidate:
                 return response, tool_iterations
 
-            parts = getattr(getattr(candidate, "content", None), "parts", [])
+            parts = getattr(getattr(candidate, "content", None), "parts", []) or []
             function_call_parts = [
                 part for part in parts if getattr(part, "function_call", None)
             ]
 
+            # PERBAIKAN: Jika tidak ada pemanggilan tool lagi, pastikan ada teks balasan
             if not function_call_parts:
+                has_text = any(getattr(p, "text", None) for p in parts)
+
+                if not has_text and tool_iterations > 0:
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(
+                                    text="Berdasarkan hasil eksekusi fungsi di atas, berikan jawaban atau rangkuman lengkap kepada pengguna."
+                                )
+                            ],
+                        )
+                    )
+                    response = await self._retry_with_backoff(
+                        lambda: client.aio.models.generate_content(
+                            model=model_id,
+                            contents=contents,
+                            config=current_config,
+                        )
+                    )
                 return response, tool_iterations
 
             tool_iterations += 1
@@ -2129,20 +2340,29 @@ class Pipe:
                     "type": "status",
                     "data": {
                         "action": "tool_calls",
-                        "description": f"Executing {len(function_call_parts)} tool call(s)…",
+                        "description": f"Executing {len(function_call_parts)} tool call(s)...",
                         "done": False,
                     },
                 }
             )
 
             function_response_parts = []
+            model_function_call_parts = []
+
             for part in function_call_parts:
                 fc = part.function_call
                 tool_name = getattr(fc, "name", "")
-                args = dict(getattr(fc, "args", {}) or {})
+                args = self._normalize_function_args(getattr(fc, "args", {}) or {})
+                # FIX Gemini 3.x: pertahankan id unik dari setiap function call.
+                tool_call_id = getattr(fc, "id", None)
                 fr = await self._execute_native_tool_call(
-                    tool_name, args, native_tools, __event_emitter__
+                    tool_name,
+                    args,
+                    native_tools,
+                    __event_emitter__,
+                    tool_call_id=tool_call_id,
                 )
+                # FIX Gemini 3.x: FunctionResponse harus menyertakan id yang sama.
                 function_response_parts.append(
                     types.Part.from_function_response(
                         name=fr["name"],
@@ -2150,20 +2370,23 @@ class Pipe:
                     )
                 )
 
-            # Append model function calls and tool results back into context
-            model_function_call_parts = [
-                types.Part.from_function_call(
-                    name=getattr(p.function_call, "name", ""),
-                    args=dict(getattr(p.function_call, "args", {}) or {}),
+                sig = getattr(part, "thought_signature", None) or getattr(
+                    part, "thoughtSignature", None
                 )
-                for p in function_call_parts
-            ]
+
+                model_function_call_parts.append(
+                    self._build_function_call_part_with_signature(
+                        name=tool_name,
+                        args=args,
+                        signature=sig,
+                        tool_call_id=tool_call_id,
+                    )
+                )
+
             contents.append(
-                {"role": "model", "parts": model_function_call_parts}
+                types.Content(role="model", parts=model_function_call_parts)
             )
-            contents.append(
-                {"role": "user", "parts": function_response_parts}
-            )
+            contents.append(types.Content(role="user", parts=function_response_parts))
 
             await __event_emitter__(
                 {
@@ -2322,18 +2545,16 @@ class Pipe:
 
                 for part in parts:
                     try:
-                        # UPDATED: Handle Function Call in Stream
                         if getattr(part, "function_call", None):
+                            fc_args = self._normalize_function_args(
+                                getattr(part.function_call, "args", None)
+                            )
                             tool_call = {
                                 "id": f"call_{uuid.uuid4().hex[:8]}",
                                 "type": "function",
                                 "function": {
                                     "name": part.function_call.name,
-                                    "arguments": json.dumps(
-                                        dict(part.function_call.args)
-                                        if part.function_call.args
-                                        else {}
-                                    ),
+                                    "arguments": json.dumps(fc_args),
                                 },
                             }
                             yield {"choices": [{"delta": {"tool_calls": [tool_call]}}]}
@@ -2435,9 +2656,19 @@ class Pipe:
 
             yield final_content
 
-        except Exception as e:
+        except (asyncio.CancelledError, Exception) as e:
             error_msg = str(e).lower()
-            if "chunk too big" in error_msg or "chunk size" in error_msg:
+            if "connection closed" in error_msg or "cancelled" in error_msg:
+                if answer_chunks:
+                    final_content = "".join(answer_chunks)
+                    await emit_chat_event(
+                        "chat:finish",
+                        {"role": "assistant", "content": final_content, "done": True},
+                    )
+                    yield final_content
+                    return
+                message = "Koneksi ke Gemini terputus di tengah jalan. Silakan coba gunakan versi API v1beta atau matikan mode streaming."
+            elif "chunk too big" in error_msg or "chunk size" in error_msg:
                 message = "Error: Image too large for processing. Please try with a smaller image (max 15 MB recommended) or reduce image quality."
             elif "quota" in error_msg or "rate limit" in error_msg:
                 message = "Error: API quota exceeded. Please try again later."
@@ -2792,10 +3023,10 @@ class Pipe:
 
             client = self._get_client()
 
-            # OpenWebUI 0.11.0 native tools must be executed server-side.
-            # If native callable tools are present, disable streaming so we can run the tool loop.
             native_tools = self._get_native_tools_from_config(generation_config)
-            has_native_tools = bool(native_tools) and self.valves.NATIVE_TOOL_CALLING_ENABLED
+            has_native_tools = (
+                bool(native_tools) and self.valves.NATIVE_TOOL_CALLING_ENABLED
+            )
             if has_native_tools and stream and not supports_image_generation:
                 stream = False
                 await __event_emitter__(
@@ -2813,7 +3044,6 @@ class Pipe:
                 if supports_image_generation:
                     stream = False
                 elif has_native_tools:
-                    # Defensive: should have been forced off above, but keep non-streaming.
                     stream = False
                 else:
                     try:
@@ -2857,7 +3087,6 @@ class Pipe:
                             }
                         )
 
-                    # Execute native tool loop when server-side tools are available.
                     if has_native_tools and not supports_image_generation:
                         response, _ = await self._run_tool_loop(
                             client,
@@ -2899,19 +3128,17 @@ class Pipe:
                     tool_calls = []
 
                     for part in parts:
-                        # UPDATED: Process Function Calls
                         if getattr(part, "function_call", None):
+                            fc_args = self._normalize_function_args(
+                                getattr(part.function_call, "args", None)
+                            )
                             tool_calls.append(
                                 {
                                     "id": f"call_{uuid.uuid4().hex[:8]}",
                                     "type": "function",
                                     "function": {
                                         "name": part.function_call.name,
-                                        "arguments": json.dumps(
-                                            dict(part.function_call.args)
-                                            if part.function_call.args
-                                            else {}
-                                        ),
+                                        "arguments": json.dumps(fc_args),
                                     },
                                 }
                             )
@@ -3024,11 +3251,32 @@ class Pipe:
                             full_response += "\n\n"
                         full_response += "\n\n".join(generated_images)
 
+                    content = full_response.strip()
+
+                    if not content:
+                        if has_native_tools:
+                            content = "Proses eksekusi fungsi telah selesai."
+                        else:
+                            content = (
+                                "[Tidak ada respon teks yang dihasilkan oleh model]"
+                            )
+
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "chat:message",
+                                "data": {
+                                    "role": "assistant",
+                                    "content": content,
+                                    "done": True,
+                                },
+                            }
+                        )
+
                     usage = self._build_usage_dict(
                         getattr(response, "usage_metadata", None)
                     )
 
-                    content = full_response if full_response else ""
                     message_data = {"role": "assistant", "content": content}
 
                     if tool_calls:
@@ -3039,7 +3287,8 @@ class Pipe:
                     }
                     if usage:
                         result["usage"] = usage
-                    return result
+
+                    return content
 
                 except Exception as e:
                     return f"Error generating content: {e}"
