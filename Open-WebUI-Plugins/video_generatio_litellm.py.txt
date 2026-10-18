@@ -1,0 +1,769 @@
+
+title LiteLLM Video Generator
+description Generates videos through a LiteLLM proxy and lets callers choose any video model they can access.
+author StartupLabs
+version 1.4
+requirements aiohttp
+
+
+import asyncio
+import base64
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+import time
+import zipfile
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Final
+from urllib.parse import urlparse
+
+import aiohttp
+from pydantic import BaseModel, Field
+
+EventEmitter = Callable[[dict[str, object]], Awaitable[None]]
+
+
+class Tools
+    class Valves(BaseModel)
+        LITELLM_BASE_URL str = Field(
+            default=httplitellm4000,
+            description=LiteLLM proxy URL, with or without a trailing v1.,
+        )
+        LITELLM_API_KEY str = Field(default=your-litellm-api-key, description=LiteLLM virtual key.)
+        OPENWEBUI_PUBLIC_BASE_URL str = Field(
+            default=,
+            description=Public HTTPS base URL for OpenWebUI. Required to use attached images as video references.,
+        )
+        DEFAULT_VIDEO_MODEL str = Field(
+            default=,
+            description=Optional LiteLLM video model used when a request does not name one. Leave blank to select randomly.,
+        )
+        NARRATION_MODEL str = Field(
+            default=,
+            description=Optional LiteLLM audio_speech model used only when narration is requested.,
+        )
+        NARRATION_VOICE str = Field(default=alloy, description=Voice for the narration model.)
+        NARRATION_INSTRUCTIONS str = Field(
+            default=,
+            description=Optional delivery direction, for example understated British documentary voice, with deliberate pauses.,
+        )
+        NARRATION_PROVIDER str = Field(
+            default=openai,
+            description=OpenRouter provider key that accepts narration instructions, for example openai.,
+        )
+        MUSIC_MODEL str = Field(
+            default=,
+            description=Optional LiteLLM audio_generation model for one soundtrack across the finished video.,
+        )
+        MUSIC_VOLUME float = Field(default=0.1, ge=0, le=1, description=Background soundtrack volume from 0 to 1.)
+        MAX_RESOLUTION str = Field(
+            default=768p,
+            description=Output-resolution ceiling, for example 720p, 768p, 1080p, 2K, or 4K. Blank uses each model default.,
+        )
+        MIN_CLIP_SECONDS int = Field(
+            default=5,
+            description=Minimum duration accepted by the selected video model. HeyGen Video 1 requires at least 5 seconds.,
+        )
+        MAX_CLIP_SECONDS int = Field(default=8, description=Maximum duration for each generated clip.)
+        FFMPEG_BIN str = Field(default=ffmpeg, description=Path to the ffmpeg executable in OpenWebUI.)
+        POLL_INTERVAL_SECONDS int = Field(default=10, description=Seconds between job-status checks.)
+        MAX_TIMEOUT_SECONDS int = Field(default=600, description=Maximum time to wait for a video job.)
+        REQUEST_TIMEOUT_SECONDS int = Field(default=300, description=Maximum duration of one proxy request.)
+
+    def __init__(self)
+        self.valves = self.Valves()
+
+    def _base_url(self) - str
+        return self.valves.LITELLM_BASE_URL.rstrip().removesuffix(v1)
+
+    @staticmethod
+    def _chat_asset_id(metadata object) - str
+        chat_id = metadata.get(chat_id) if isinstance(metadata, Mapping) else None
+        return chat_id if isinstance(chat_id, str) and re.fullmatch(r[A-Za-z0-9_-]+, chat_id) else unassigned
+
+    def _headers(self) - dict[str, str]
+        return {Authorization fBearer {self.valves.LITELLM_API_KEY}, Content-Type applicationjson}
+
+    def _configured_model(self) - str
+        return self.valves.DEFAULT_VIDEO_MODEL.strip()
+
+    @staticmethod
+    def _value(value object, default object) - object
+        if type(value).__name__ != FieldInfo
+            return value
+        field_default Final = getattr(value, default, default)
+        return (
+            default
+            if field_default is Ellipsis or type(field_default).__name__ == PydanticUndefinedType
+            else field_default
+        )
+
+    async def _emit(self, emitter EventEmitter  None, description str, done bool = False) - None
+        if emitter is not None
+            await emitter({type status, data {description description, done done}})
+
+    async def _video_models(self, session aiohttp.ClientSession) - tuple[str, ...]
+        async with session.get(f{self._base_url()}v1models, headers=self._headers()) as response
+            if response.status != 200
+                raise RuntimeError(fLiteLLM model listing failed with HTTP {response.status} {await response.text()})
+            body Final[object] = await response.json()
+        if not isinstance(body, dict) or not isinstance(body.get(data), list)
+            raise RuntimeError(LiteLLM returned an invalid model listing)
+        return tuple(
+            entry[id]
+            for entry in body[data]
+            if isinstance(entry, dict) and isinstance(entry.get(id), str) and entry.get(mode) == video_generation
+        )
+
+    @staticmethod
+    def _selected_chat_model(model object) - str
+        if isinstance(model, str)
+            return model.strip()
+        if isinstance(model, Mapping)
+            for key in (id, model, model_id)
+                value = model.get(key)
+                if isinstance(value, str) and value.strip()
+                    return value.strip()
+        return 
+
+    @staticmethod
+    def _requested_seconds(value str) - int  None
+        try
+            seconds = int(float(value))
+        except ValueError
+            return None
+        return seconds if seconds  0 else None
+
+    @staticmethod
+    def _public_image_urls(images list[str]) - list[str]
+        return [image for image in images if urlparse(image).scheme in {http, https}]
+
+    def _stage_attached_images(self, images list[str]) - tuple[str  None, tuple[str, ...]]
+        base_url Final = self.valves.OPENWEBUI_PUBLIC_BASE_URL.rstrip()
+        if not base_url or not images
+            return None, ()
+        from open_webui.config import STATIC_DIR
+
+        directory Final = os.path.join(STATIC_DIR, video-references, secrets.token_urlsafe(16))
+        os.makedirs(directory, exist_ok=True)
+        urls list[str] = []
+        for index, image in enumerate(images)
+            if not image.startswith(dataimage) or ;base64, not in image
+                continue
+            header, encoded = image.split(,, 1)
+            extension Final = header.removeprefix(dataimage).split(;, 1)[0]
+            if extension not in {jpeg, jpg, png, webp}
+                continue
+            try
+                content Final = base64.b64decode(encoded, validate=True)
+            except ValueError
+                continue
+            filename Final = freference-{index}.{extension}
+            with open(os.path.join(directory, filename), wb) as output
+                output.write(content)
+            urls.append(f{base_url}staticvideo-references{os.path.basename(directory)}{filename})
+        return directory, tuple(urls)
+
+    @staticmethod
+    def _unsupported_resolution_error(status int, body str, payload Mapping[str, object]) - bool
+        return (
+            status == 400
+            and resolution in payload
+            and resolution in body.lower()
+            and not supported in body.lower()
+        )
+
+    @staticmethod
+    def _resolution_rank(value str) - int  None
+        normalized = value.strip().lower()
+        if normalized.endswith(p) and normalized[-1].isdigit()
+            return int(normalized[-1])
+        if normalized.endswith(k)
+            try
+                return int(float(normalized[-1])  1024)
+            except ValueError
+                return None
+        return None
+
+    def _capped_resolution(self, requested str) - str
+        maximum Final = self.valves.MAX_RESOLUTION.strip()
+        if not maximum
+            return requested
+        maximum_rank Final = self._resolution_rank(maximum)
+        requested_rank Final = self._resolution_rank(requested)
+        if requested_rank is None or maximum_rank is None or requested_rank = maximum_rank
+            return requested or maximum
+        return maximum
+
+    @staticmethod
+    def _inline_html_response(content str) - object
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse(content=content, media_type=texthtml, headers={Content-Disposition inline})
+
+    @staticmethod
+    def _parse_scene_plan(
+        content object, min_clip_seconds int, max_clip_seconds int, requested_seconds int  None
+    ) - tuple[tuple[tuple[str, int, str], ...], str]
+        if isinstance(content, list)
+            content = .join(
+                part.get(text, ) for part in content if isinstance(part, dict) and isinstance(part.get(text), str)
+            )
+        if not isinstance(content, str)
+            raise RuntimeError(Scene planner did not return text content)
+        candidate = content.strip()
+        if candidate.startswith(```)
+            candidate = candidate.split(n, 1)[1] if n in candidate else 
+            candidate = candidate.rsplit(```, 1)[0].strip()
+        if not candidate.startswith({)
+            start, end = candidate.find({), candidate.rfind(})
+            candidate = candidate[start  end + 1] if start = 0 and end  start else candidate
+        try
+            plan Final[object] = json.loads(candidate)
+        except json.JSONDecodeError as error
+            raise RuntimeError(Scene planner did not return valid JSON) from error
+        scenes Final = plan.get(scenes) if isinstance(plan, dict) else None
+        narration Final = plan.get(narration, ) if isinstance(plan, dict) else 
+        planned_scenes list[tuple[str, int  None, str]] = []
+        if isinstance(scenes, list)
+            for scene in scenes
+                if not isinstance(scene, dict)
+                    continue
+                scene_prompt = scene.get(prompt)
+                scene_seconds = scene.get(seconds)
+                scene_narration = scene.get(narration, )
+                if isinstance(scene_seconds, str)
+                    scene_seconds = Tools._requested_seconds(scene_seconds)
+                if isinstance(scene_prompt, str) and scene_prompt.strip()
+                    planned_scenes.append(
+                        (
+                            scene_prompt.strip(),
+                            scene_seconds if isinstance(scene_seconds, int) else None,
+                            scene_narration.strip() if isinstance(scene_narration, str) else ,
+                        )
+                    )
+        if not planned_scenes
+            raise RuntimeError(Scene planner returned no usable scenes)
+        if requested_seconds
+            scene_count Final = len(planned_scenes)
+            if not min_clip_seconds  scene_count = requested_seconds = max_clip_seconds  scene_count
+                raise RuntimeError(Scene planner returned an impractical number of scenes for the requested duration)
+            base, remainder = divmod(requested_seconds, scene_count)
+            normalized_seconds Final = tuple(base + (1 if index  remainder else 0) for index in range(scene_count))
+            return (
+                tuple(
+                    (scene_prompt, normalized_seconds[index], scene_narration)
+                    for index, (scene_prompt, _, scene_narration) in enumerate(planned_scenes)
+                ),
+                narration.strip() if isinstance(narration, str) else ,
+            )
+        valid_scenes Final = tuple(
+            (scene_prompt, scene_seconds, scene_narration)
+            for scene_prompt, scene_seconds, scene_narration in planned_scenes
+            if isinstance(scene_seconds, int) and min_clip_seconds = scene_seconds = max_clip_seconds
+        )
+        if not valid_scenes
+            raise RuntimeError(Scene planner returned no usable scene durations)
+        return valid_scenes, narration.strip() if isinstance(narration, str) else 
+
+    async def _scene_plan(
+        self, session aiohttp.ClientSession, planner str, prompt str, requested_seconds int  None
+    ) - tuple[tuple[tuple[str, int, str], ...], str]
+        total_seconds Final = requested_seconds or self.valves.MAX_CLIP_SECONDS
+        instruction Final = (
+            Turn the user's request into independent video scenes. Return JSON only with 
+            '{scenes[{promptscene prompt,seconds8,narrationwords for this scene only}]}. '
+            fThe scenes together must total about {total_seconds} seconds. Each scene must be self-contained, 
+            fhave a whole-number seconds value from {self.valves.MIN_CLIP_SECONDS} to {self.valves.MAX_CLIP_SECONDS}. 
+            Set each scene narration to an empty string unless the user explicitly requests narration, then split it across scenes to fit their durations.
+        )
+        request Final = {
+            model planner,
+            messages [{role system, content instruction}, {role user, content prompt}],
+        }
+        async with session.post(
+            f{self._base_url()}v1chatcompletions, headers=self._headers(), json=request
+        ) as response
+            if response.status != 200
+                raise RuntimeError(fScene planning failed with HTTP {response.status} {await response.text()})
+            body Final[object] = await response.json()
+        choices Final = body.get(choices) if isinstance(body, dict) else None
+        first_choice Final = choices[0] if isinstance(choices, list) and choices else None
+        message Final = first_choice.get(message) if isinstance(first_choice, dict) else None
+        content Final = message.get(content) if isinstance(message, dict) else None
+        return self._parse_scene_plan(
+            content, self.valves.MIN_CLIP_SECONDS, self.valves.MAX_CLIP_SECONDS, requested_seconds
+        )
+
+    async def _narration_audio(self, session aiohttp.ClientSession, narration str) - bytes
+        model Final = self.valves.NARRATION_MODEL.strip()
+        if not model
+            raise RuntimeError(Narration was requested, but NARRATION_MODEL is not configured in the tool settings)
+        instructions Final = self.valves.NARRATION_INSTRUCTIONS.strip()
+        provider Final = self.valves.NARRATION_PROVIDER.strip()
+        payload Final = {
+            model model,
+            input self._spoken_narration(narration, preserve_cues=kokoro in model.lower()),
+            voice self.valves.NARRATION_VOICE,
+            (
+                {provider {options {provider {instructions instructions}}}}
+                if instructions and provider
+                else {}
+            ),
+        }
+        async with session.post(
+            f{self._base_url()}v1audiospeech, headers=self._headers(), json=payload
+        ) as response
+            if response.status != 200
+                raise RuntimeError(fNarration generation failed with HTTP {response.status} {await response.text()})
+            return await response.read()
+
+    @staticmethod
+    def _spoken_narration(narration str, preserve_cues bool = False) - str
+        if preserve_cues
+            return re.sub(r[(d+(.d+))-second pause], r[pause1s], narration, flags=re.IGNORECASE)
+        return re.sub(r[[^]]], , narration).strip()
+
+    async def _music_audio(self, session aiohttp.ClientSession, prompt str) - bytes  None
+        model Final = self.valves.MUSIC_MODEL.strip()
+        if not model
+            return None
+        request Final = {
+            model model,
+            messages [
+                {
+                    role user,
+                    content fCreate one instrumental soundtrack for this video. No speech or vocals. {prompt},
+                }
+            ],
+            modalities [audio],
+            stream True,
+        }
+        async with session.post(
+            f{self._base_url()}v1chatcompletions, headers=self._headers(), json=request
+        ) as response
+            if response.status != 200
+                raise RuntimeError(fMusic generation failed with HTTP {response.status} {await response.text()})
+            chunks list[bytes] = []
+            pending = 
+            async for raw_chunk in response.content.iter_chunked(65536)
+                events = (pending + raw_chunk.decode(utf-8, errors=replace)).split(nn)
+                pending = events.pop()
+                for event in events
+                    line Final = event.strip()
+                    if not line.startswith(data) or line == data [DONE]
+                        continue
+                    try
+                        chunk Final = self._decode_music_stream_chunk(json.loads(line.removeprefix(data).strip()))
+                    except json.JSONDecodeError as error
+                        raise RuntimeError(Music model returned an invalid streaming response) from error
+                    if chunk is not None
+                        chunks.append(chunk)
+        if not chunks
+            raise RuntimeError(Music model did not return audio data)
+        return b.join(chunks)
+
+    async def _optional_music_audio(
+        self, session aiohttp.ClientSession, prompt str, emitter EventEmitter  None
+    ) - tuple[bytes  None, str  None]
+        try
+            return await self._music_audio(session, prompt), None
+        except RuntimeError as error
+            await self._emit(emitter, fSoundtrack unavailable. Continuing with the completed video {error})
+            return None, str(error)
+
+    @staticmethod
+    def _decode_music_audio(body object) - bytes
+        choices Final = body.get(choices) if isinstance(body, dict) else None
+        choice Final = choices[0] if isinstance(choices, list) and choices else None
+        message Final = choice.get(message) if isinstance(choice, dict) else None
+        audio Final = message.get(audio) if isinstance(message, dict) else None
+        data Final = audio.get(data) if isinstance(audio, dict) else None
+        if not isinstance(data, str)
+            raise RuntimeError(Music model did not return audio data)
+        try
+            return base64.b64decode(data, validate=True)
+        except ValueError as error
+            raise RuntimeError(Music model returned invalid audio data) from error
+
+    @staticmethod
+    def _decode_music_stream_chunk(body object) - bytes  None
+        choices Final = body.get(choices) if isinstance(body, dict) else None
+        choice Final = choices[0] if isinstance(choices, list) and choices else None
+        delta Final = choice.get(delta) if isinstance(choice, dict) else None
+        audio Final = delta.get(audio) if isinstance(delta, dict) else None
+        data Final = audio.get(data) if isinstance(audio, dict) else None
+        if data is None
+            return None
+        if not isinstance(data, str)
+            raise RuntimeError(Music model returned invalid audio data)
+        try
+            return base64.b64decode(data, validate=True)
+        except ValueError as error
+            raise RuntimeError(Music model returned invalid audio data) from error
+
+    def _stitch_clips(self, clips tuple[bytes, ...], music bytes  None, narration bytes  None) - bytes
+        with tempfile.TemporaryDirectory(prefix=litellm-video-) as temporary_directory
+            clip_paths list[str] = []
+            for index, clip in enumerate(clips)
+                path = os.path.join(temporary_directory, fclip-{index}.mp4)
+                with open(path, wb) as output
+                    output.write(clip)
+                clip_paths.append(path)
+            manifest = os.path.join(temporary_directory, clips.txt)
+            with open(manifest, w, encoding=utf-8) as output
+                output.writelines(ffile '{path}'n for path in clip_paths)
+            stitched = os.path.join(temporary_directory, stitched.mp4)
+            concatenate = subprocess.run(
+                [self.valves.FFMPEG_BIN, -y, -f, concat, -safe, 0, -i, manifest, -c, copy, stitched],
+                capture_output=True,
+                check=False,
+            )
+            if concatenate.returncode != 0
+                details = concatenate.stderr.decode(utf-8, errors=replace)[-1000]
+                raise RuntimeError(fCould not stitch video clips with ffmpeg {details})
+            final_path = stitched
+            if music is not None or narration is not None
+                music_path = os.path.join(temporary_directory, music.mp3)
+                narration_path = os.path.join(temporary_directory, narration.mp3)
+                final_path = os.path.join(temporary_directory, final.mp4)
+                if music is not None
+                    with open(music_path, wb) as output
+                        output.write(music)
+                if narration is not None
+                    with open(narration_path, wb) as output
+                        output.write(narration)
+                audio_arguments Final = (
+                    [
+                        -stream_loop,
+                        -1,
+                        -i,
+                        music_path,
+                        -i,
+                        narration_path,
+                        -filter_complex,
+                        f[1a]volume={self.valves.MUSIC_VOLUME}[music];[0a][music][2a]amix=inputs=3duration=first[audio],
+                        -map,
+                        0v0,
+                        -map,
+                        [audio],
+                    ]
+                    if music is not None and narration is not None
+                    else [
+                        -stream_loop,
+                        -1,
+                        -i,
+                        music_path,
+                        -filter_complex,
+                        f[1a]volume={self.valves.MUSIC_VOLUME}[music];[0a][music]amix=inputs=2duration=first[audio],
+                        -map,
+                        0v0,
+                        -map,
+                        [audio],
+                    ]
+                    if music is not None
+                    else [
+                        -i,
+                        narration_path,
+                        -filter_complex,
+                        [0a][1a]amix=inputs=2duration=first[audio],
+                        -map,
+                        0v0,
+                        -map,
+                        [audio],
+                    ]
+                )
+                mix = subprocess.run(
+                    [
+                        self.valves.FFMPEG_BIN,
+                        -y,
+                        -i,
+                        stitched,
+                        audio_arguments,
+                        -cv,
+                        copy,
+                        -ca,
+                        aac,
+                        -shortest,
+                        final_path,
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                if mix.returncode != 0
+                    details = mix.stderr.decode(utf-8, errors=replace)[-1000]
+                    raise RuntimeError(fCould not add narration with ffmpeg {details})
+            with open(final_path, rb) as output
+                return output.read()
+
+    async def _generate_clip(
+        self,
+        session aiohttp.ClientSession,
+        payload dict[str, object],
+        selected_model str,
+        emitter EventEmitter  None,
+    ) - bytes
+        submission_payload = payload.copy()
+        async with session.post(
+            f{self._base_url()}v1videos, headers=self._headers(), json=submission_payload
+        ) as response
+            if response.status in {200, 201, 202}
+                created Final[object] = await response.json()
+            else
+                error_body Final = await response.text()
+                if not self._unsupported_resolution_error(response.status, error_body, submission_payload)
+                    raise RuntimeError(fVideo submission failed with HTTP {response.status} {error_body})
+                submission_payload.pop(resolution)
+                await self._emit(emitter, Selected resolution is unsupported; retrying with the model default...)
+                async with session.post(
+                    f{self._base_url()}v1videos, headers=self._headers(), json=submission_payload
+                ) as retry
+                    if retry.status not in {200, 201, 202}
+                        raise RuntimeError(fVideo submission failed with HTTP {retry.status} {await retry.text()})
+                    created = await retry.json()
+        if not isinstance(created, dict) or not isinstance(created.get(id), str)
+            raise RuntimeError(LiteLLM did not return a video job id)
+        video_id Final = created[id]
+        started Final = time.monotonic()
+        while True
+            elapsed Final = int(time.monotonic() - started)
+            if elapsed  self.valves.MAX_TIMEOUT_SECONDS
+                raise RuntimeError(fVideo generation timed out after {self.valves.MAX_TIMEOUT_SECONDS} seconds)
+            await self._emit(emitter, fGenerating video with {selected_model} ({elapsed}s elapsed)...)
+            await asyncio.sleep(self.valves.POLL_INTERVAL_SECONDS)
+            async with session.get(f{self._base_url()}v1videos{video_id}, headers=self._headers()) as response
+                if response.status != 200
+                    raise RuntimeError(
+                        fVideo status check failed with HTTP {response.status} {await response.text()}
+                    )
+                status_body Final[object] = await response.json()
+            if not isinstance(status_body, dict)
+                raise RuntimeError(LiteLLM returned an invalid video status response)
+            if status_body.get(status) == completed
+                break
+            if status_body.get(status) in {failed, cancelled, expired}
+                raise RuntimeError(fVideo generation failed {status_body.get('error', 'unknown error')})
+        async with session.get(f{self._base_url()}v1videos{video_id}content, headers=self._headers()) as response
+            if response.status != 200
+                raise RuntimeError(fVideo download failed with HTTP {response.status} {await response.text()})
+            return await response.read()
+
+    async def list_video_models(self, __event_emitter__ EventEmitter  None = None) - str
+        Lists video-generation models available through this user's LiteLLM key.
+        if self.valves.LITELLM_API_KEY == your-litellm-api-key
+            return Error Set LITELLM_API_KEY in the tool settings.
+        await self._emit(__event_emitter__, Fetching available LiteLLM video models...)
+        timeout Final = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session
+            discovered_models Final = await self._video_models(session)
+        configured_model Final = self._configured_model()
+        models Final = tuple(
+            dict.fromkeys((discovered_models, configured_model) if configured_model else discovered_models)
+        )
+        if not models
+            return No accessible video-generation models were found. Add a video model to models.txt and grant this key access.
+        await self._emit(__event_emitter__, Video-model list loaded., True)
+        return Available LiteLLM video modelsn + n.join(f- {model} for model in models)
+
+    async def generate_video(
+        self,
+        prompt str,
+        model_id str = Field(
+            default=, description=Optional LiteLLM video model. Omit it to select any accessible video model.
+        ),
+        aspect_ratio str = Field(default=169, description=Optional aspect ratio, for example 169 or 916.),
+        duration_seconds str = Field(default=, description=Optional video duration in seconds.),
+        resolution str = Field(default=, description=Optional resolution, for example 720p or 1080p.),
+        generate_audio bool  None = Field(
+            default=None,
+            description=Ignored. Clip dialogue and sound effects are preserved; the tool supplies one soundtrack.,
+        ),
+        seed int  None = Field(default=None, description=Optional generation seed.),
+        image_mode str = Field(default=first_frame, description=first_frame, last_frame, or reference.),
+        image_urls list[str]  None = Field(default=None, description=Optional public or data image URLs.),
+        provider_options dict[str, object]  None = Field(
+            default=None, description=Optional OpenRouter provider options.
+        ),
+        __messages__ list[dict[str, object]]  None = None,
+        __metadata__ Mapping[str, object]  None = None,
+        __model__ object  None = None,
+        __event_emitter__ EventEmitter  None = None,
+    ) - str  tuple[object, str]
+        
+        Generates a video through LiteLLM. Longer requests are planned by the currently selected chat model,
+        generated as independent clips, and stitched together automatically. Specify model_id to override the Tool
+        Settings default. Without either, one accessible video-generation model is selected at random.
+
+        param prompt Detailed description of the desired video.
+        param model_id Optional LiteLLM video model from list_video_models. Overrides the Tool Settings default.
+        param aspect_ratio Optional aspect ratio such as 169 or 916.
+        param duration_seconds Optional duration in seconds.
+        param resolution Optional resolution such as 720p or 1080p.
+        param generate_audio Ignored. Clip dialogue and sound effects are preserved; the tool supplies one soundtrack.
+        param seed Optional integer generation seed.
+        param image_mode first_frame, last_frame, or reference.
+        param image_urls Optional public or data image URLs.
+        param provider_options Optional OpenRouter provider options.
+        
+        if self.valves.LITELLM_API_KEY == your-litellm-api-key
+            return Error Set LITELLM_API_KEY in the tool settings.
+        model_id = str(self._value(model_id, ))
+        aspect_ratio = str(self._value(aspect_ratio, 169))
+        duration_seconds = str(self._value(duration_seconds, ))
+        resolution = self._capped_resolution(str(self._value(resolution, )))
+        seed = self._value(seed, None)
+        image_mode = str(self._value(image_mode, first_frame))
+        image_urls = self._value(image_urls, None)
+        provider_options = self._value(provider_options, None)
+        requested_seconds Final = self._requested_seconds(duration_seconds)
+        selected_chat_model Final = self._selected_chat_model(__model__)
+        requested_images list[str] = list(image_urls) if isinstance(image_urls, list) else []
+        attached_images list[str] = []
+        if __messages__ and isinstance(__messages__[-1], dict)
+            message_images Final = __messages__[-1].get(images)
+            if isinstance(message_images, list)
+                attached_images = [
+                    image for image in message_images if isinstance(image, str) and image.startswith(dataimage)
+                ]
+        images Final = self._public_image_urls(requested_images)
+        timeout Final = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT_SECONDS)
+        staged_directory str  None = None
+        try
+            staged_directory, staged_images = self._stage_attached_images(attached_images)
+            images = [images, staged_images]
+            async with aiohttp.ClientSession(timeout=timeout) as session
+                if attached_images and not staged_images
+                    await self._emit(
+                        __event_emitter__,
+                        Skipping attached image data set OPENWEBUI_PUBLIC_BASE_URL to a public HTTPS URL.,
+                    )
+                models Final = await self._video_models(session)
+                configured_model Final = self._configured_model()
+                selected_model Final = model_id or configured_model or (secrets.choice(models) if models else )
+                if not selected_model
+                    return No accessible video-generation models were found. Add one to models.txt first.
+                if selected_model not in models and selected_model != configured_model
+                    return fError {selected_model} is not an accessible LiteLLM video-generation model.
+                if requested_seconds and requested_seconds  self.valves.MAX_CLIP_SECONDS and not selected_chat_model
+                    return (
+                        OpenWebUI did not supply the currently selected chat model, so this tool cannot plan the 
+                        requested multi-scene video. Select a chat model and try again.
+                    )
+                if selected_chat_model
+                    scenes, _ = await self._scene_plan(session, selected_chat_model, prompt, requested_seconds)
+                else
+                    scenes = ((prompt, requested_seconds or self.valves.MAX_CLIP_SECONDS, ),)
+                clips list[bytes] = []
+                scene_assets list[bytes] = []
+                narration_assets list[bytes] = []
+                for index, (scene_prompt, scene_seconds, scene_narration) in enumerate(scenes, start=1)
+                    payload dict[str, object] = {
+                        model selected_model,
+                        prompt f{scene_prompt}nDo not include background music. {'Do not include dialogue or spoken words; narration is added separately. Preserve sound effects.' if scene_narration else 'Preserve requested dialogue and sound effects.'},
+                        seconds str(scene_seconds),
+                        ({aspect_ratio aspect_ratio} if aspect_ratio else {}),
+                        ({resolution resolution} if resolution else {}),
+                        generate_audio True,
+                        ({seed seed + index - 1} if isinstance(seed, int) else {}),
+                        ({provider {options provider_options}} if isinstance(provider_options, dict) else {}),
+                    }
+                    if images
+                        if image_mode == reference
+                            payload[input_references] = [
+                                {type image_url, image_url {url image}} for image in images
+                            ]
+                        else
+                            modes Final = (
+                                (last_frame, first_frame)
+                                if image_mode == last_frame
+                                else (first_frame, last_frame)
+                            )
+                            payload[frame_images] = [
+                                {type image_url, image_url {url image}, frame_type modes[position]}
+                                for position, image in enumerate(images[2])
+                            ]
+                    await self._emit(
+                        __event_emitter__, fGenerating scene {index} of {len(scenes)} with {selected_model}...
+                    )
+                    clip Final = await self._generate_clip(session, payload, selected_model, __event_emitter__)
+                    scene_assets.append(clip)
+                    if scene_narration
+                        await self._emit(
+                            __event_emitter__, fGenerating narration for scene {index} of {len(scenes)}...
+                        )
+                        narration_audio Final = await self._narration_audio(session, scene_narration)
+                        narration_assets.append(narration_audio)
+                        clips.append(await asyncio.to_thread(self._stitch_clips, (clip,), None, narration_audio))
+                    else
+                        clips.append(clip)
+                await self._emit(__event_emitter__, Generating soundtrack...)
+                music_audio, soundtrack_error = await self._optional_music_audio(session, prompt, __event_emitter__)
+                await self._emit(__event_emitter__, Stitching generated clips...)
+                content Final = await asyncio.to_thread(self._stitch_clips, tuple(clips), music_audio, None)
+            from open_webui.config import STATIC_DIR
+
+            static_videos Final = os.path.join(STATIC_DIR, videos, self._chat_asset_id(__metadata__))
+            os.makedirs(static_videos, exist_ok=True)
+            chat_asset_id Final = self._chat_asset_id(__metadata__)
+            filename Final = f{secrets.token_urlsafe(16)}.mp4
+            with open(os.path.join(static_videos, filename), wb) as output
+                output.write(content)
+            url Final = fstaticvideos{chat_asset_id}{filename}
+            asset_urls list[str] = []
+            for index, clip in enumerate(scene_assets, start=1)
+                asset_filename Final = f{secrets.token_urlsafe(16)}-scene-{index}.mp4
+                with open(os.path.join(static_videos, asset_filename), wb) as output
+                    output.write(clip)
+                asset_urls.append(fstaticvideos{chat_asset_id}{asset_filename})
+            safe_ratio Final = aspect_ratio.replace(, ) if aspect_ratio.count() == 1 else 169
+            audio_files = [
+                (f{secrets.token_urlsafe(16)}-scene-{index}-narration.mp3, audio)
+                for index, audio in enumerate(narration_assets, start=1)
+            ] + ([(f{secrets.token_urlsafe(16)}-soundtrack.mp3, music_audio)] if music_audio is not None else [])
+            for audio_filename, audio in audio_files
+                with open(os.path.join(static_videos, audio_filename), wb) as output
+                    output.write(audio)
+            archive_filename Final = f{secrets.token_urlsafe(16)}-assets.zip
+            archive_path Final = os.path.join(static_videos, archive_filename)
+            with zipfile.ZipFile(archive_path, w, compression=zipfile.ZIP_DEFLATED) as archive
+                archive.write(os.path.join(static_videos, filename), final-video.mp4)
+                for index, asset_filename in enumerate(
+                    (asset_url.rsplit(, 1)[-1] for asset_url in asset_urls), start=1
+                )
+                    archive.write(os.path.join(static_videos, asset_filename), fscene-{index}.mp4)
+                for index, (audio_filename, _) in enumerate(audio_files, start=1)
+                    archive.write(os.path.join(static_videos, audio_filename), faudio-{index}.mp3)
+            archive_url Final = fstaticvideos{chat_asset_id}{archive_filename}
+            html Final = f!doctype html
+htmlheadstyle
+ {{ box-sizing border-box; }}
+body {{ margin 0; padding 0; background #000; font-family Arial, Helvetica, sans-serif; }}
+video {{ display block; width 100%; aspect-ratio {safe_ratio}; background #000; border-radius 8px; }}
+section {{ color #fff; padding 2px 8px; line-height 1.25; }}
+a {{ color #fff; font-weight 600; }}
+styleheadbody
+video controls autoplay loopsource src={url} type=videomp4video
+sectiona href={archive_url} downloadDownload all assetsasection
+script
+function reportHeight() {{ parent.postMessage({{ type 'iframeheight', height document.body.scrollHeight }}, ''); }}
+window.addEventListener('load', reportHeight);
+document.querySelector('video').addEventListener('loadedmetadata', () = setTimeout(reportHeight, 0));
+new ResizeObserver(reportHeight).observe(document.body);
+scriptbodyhtml
+            await self._emit(__event_emitter__, Video loaded., True)
+            context Final = (
+                fThe video and individual scene clips are embedded above. Do not create external links. Soundtrack generation failed, so the completed video was returned without it {soundtrack_error}
+                if soundtrack_error
+                else fThe video and individual scene clips are embedded above. Do not create external links. Generated with {selected_model}.
+            )
+            return self._inline_html_response(html), context
+        except Exception as error
+            await self._emit(__event_emitter__, fVideo generation error {error}, True)
+            return fVideo generation failed {error}
+        finally
+            if staged_directory is not None
+                shutil.rmtree(staged_directory, ignore_errors=True)
