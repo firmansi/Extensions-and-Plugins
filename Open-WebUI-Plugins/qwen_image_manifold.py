@@ -194,7 +194,7 @@ class Pipe:
             description="Prefix added to each model name shown in Open WebUI.",
         )
         default_size: IMAGE_SIZES = Field(
-            default="2048*2048",
+            default="1024*1024",
             description=(
                 "Default output size for generation when no size keyword is "
                 "detected. Unsupported values fall back to the family default."
@@ -550,15 +550,18 @@ class Pipe:
             ("3:2", "3/2", "three by two"): ("1536*1024", "1024*1536"),
             ("2:3", "2/3", "two by three"): ("1024*1536", "1536*1024"),
             ("1:1", "square", "instagram post", "profile picture", "avatar"): (
-                "2048*2048",
-                "2048*2048",
+                "1024*1024",
+                "1024*1024",
             ),
         }
         for keywords, (landscape_size, portrait_size) in ar_map.items():
-            if any(kw in prompt_lower for kw in keywords):
-                if any(v in prompt_lower for v in vertical_words):
-                    return portrait_size
-                return landscape_size
+            for kw in keywords:
+                # Use word boundary regex to avoid false positives like "1:1" matching "11:11"
+                pattern = r'(?<!\d)' + re.escape(kw) + r'(?!\d)'
+                if re.search(pattern, prompt_lower):
+                    if any(v in prompt_lower for v in vertical_words):
+                        return portrait_size
+                    return landscape_size
 
         return default
 
@@ -570,7 +573,7 @@ class Pipe:
         if requested and _size_is_valid(family, requested):
             return requested
         if family in ("qwen-image-3.0", "qwen-image-2.0", "unknown"):
-            return "1024*1024" if editing else "2048*2048"
+            return "1024*1024"
         if family in ("qwen-image-edit-plus", "qwen-image-edit-max"):
             return "1024*1024"
         if family in ("qwen-image-max", "qwen-image-plus"):

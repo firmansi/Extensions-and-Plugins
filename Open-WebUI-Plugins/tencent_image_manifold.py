@@ -1,7 +1,7 @@
 """
 title: Tencent TokenHub Image Generation & Editing (Manifold)
 author: dfirmans (upgraded by AI)
-version: 1.0.0
+version: 1.2.0
 description: >
   Manifold Pipe for Tencent Cloud LLM Service TokenHub image models
   (https://tokenhub-intl.tencentcloudmaas.com/v1). Every model listed in the
@@ -9,10 +9,16 @@ description: >
   one function can serve the whole family: Tencent Hunyuan Hy-Image
   (hy-image-v3 / hy-image-v3.5-preview), WAND-Vega-Image (lite / flash / pro),
   plus third-party models hosted through the TokenHub AI gateway such as
-  Seedream-Image v5.0 (pro / lite), Vidu-Image-q2 and Kling-Image.
-  Text-to-image and image-to-image (editing) are routed automatically from the
-  attached image, with per-family endpoint, size and sampling handling built on
-  the official docs for docs.product/1300 (Hy Image, WAND, Vidu, Seedream).
+  Seedream-Image v5.0 (pro / lite) and Vidu-Image-q2.
+  Text-to-image and image-to-image (editing) are routed automatically, and a
+  follow-up instruction with no image attached reuses the most recent picture
+  from the conversation, so "change the colour to blue" edits the image that
+  was just produced instead of starting a new one. Per-family endpoint, size
+  and sampling handling is built on the official docs for docs.product/1300
+  (Hy Image, WAND, Vidu, Seedream). The requested output geometry is parsed
+  from the prompt once and then translated into whatever the target family
+  accepts, so asking for 1:1 really does produce a 1:1 image instead of a
+  silently substituted default.
   Compatible with Open WebUI 0.11.4+.
 required_open_webui_version: 0.11.4
 requirements: pillow, httpx, anyio
@@ -22,10 +28,12 @@ import asyncio
 import base64
 import io
 import json
+import math
 import random
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Tuple
 
 import anyio
@@ -44,9 +52,6 @@ DEFAULT_MODELS = (
     "seedream-image-v5.0-pro, "
     "seedream-image-v5.0-lite, "
     "vidu-image-q2, "
-    "kling-image-v3, "
-    "kling-image-o1, "
-    "kling-image-v3-omni, "
     "wand-vega-image-lite, "
     "wand-vega-image-flash, "
     "wand-vega-image-pro"
@@ -127,12 +132,328 @@ SEEDREAM_PIXEL_RANGE = {
     "seedream-image-v5.0-lite": (3686400, 16777216),
 }
 
+# ---------------------------------------------------------------------------
+# Aspect-ratio engine
+# ---------------------------------------------------------------------------
+# Every request is first reduced to a canonical aspect ratio (the keys below),
+# then translated into whatever the target family actually accepts: a pixel
+# size (Hunyuan / Seedream / WAND), an aspect_ratio string (Vidu), or a
+# bare resolution tier when the ratio was never specified and the model should
+# be left to decide on its own.
+
+# Canonical ratios, widest to tallest. The `w:h` spelling is exactly what the
+# `aspect_ratio` field of the Vidu-Image family expects.
+ASPECT_RATIOS: Dict[str, float] = {
+    "21:9": 21 / 9,
+    "2:1": 2 / 1,
+    "16:9": 16 / 9,
+    "3:2": 3 / 2,
+    "4:3": 4 / 3,
+    "5:4": 5 / 4,
+    "1:1": 1 / 1,
+    "4:5": 4 / 5,
+    "3:4": 3 / 4,
+    "2:3": 2 / 3,
+    "9:16": 9 / 16,
+    "1:2": 1 / 2,
+    "9:21": 9 / 21,
+}
+
+# `aspect_ratio` enum of the Vidu-Image family. Ratios outside this list (4:5,
+# 5:4, 1:2) are snapped into it rather than sent and rejected.
+HOSTED_ASPECTS: Tuple[str, ...] = (
+    "21:9",
+    "16:9",
+    "3:2",
+    "4:3",
+    "1:1",
+    "3:4",
+    "2:3",
+    "9:16",
+)
+
+# Pixel budget per resolution tier, used to derive a concrete WxH for the
+# families that take pixels instead of an aspect ratio.
+TIER_PIXEL_BUDGET: Dict[str, int] = {
+    "1K": 1048576,
+    "1.5K": 2359296,
+    "2K": 4194304,
+    "3K": 9437184,
+    "4K": 16777216,
+}
+
+# Hy-Image-3.0's 37 documented preset sizes (docs.product/1300/83708). Every one
+# of them satisfies w,h in [512, 2048] with area <= 1024x1024, so any requested
+# ratio can be snapped onto the closest real preset.
+HUNYUAN_V3_PRESET_SIZES: Tuple[Tuple[int, int], ...] = (
+    (2048, 512), (1984, 512), (1920, 512), (1856, 512), (1792, 512), (1728, 512),
+    (1664, 512), (1600, 512), (1536, 512), (1472, 576), (1408, 640), (1344, 704),
+    (1280, 768), (1216, 832), (1152, 896), (1088, 960), (1024, 1024), (960, 1088),
+    (896, 1152), (832, 1216), (768, 1280), (704, 1344), (640, 1408), (576, 1472),
+    (512, 1536), (512, 1600), (512, 1664), (512, 1728), (512, 1792), (512, 1856),
+    (512, 1920), (512, 1984), (512, 2048), (768, 1024), (720, 1280), (1024, 768),
+    (1280, 720),
+)
+
+# WAND-Vega-Image preset sizes, as (width, height) pairs. The API only accepts
+# these exact strings, so any requested ratio has to snap onto one of them.
+WAND_PRESET_PAIRS: Tuple[Tuple[int, int], ...] = tuple(
+    sorted(
+        (
+            (1024, 1024), (2048, 2048), (4096, 4096), (1024, 1536), (1440, 2160),
+            (3328, 4992), (1536, 1024), (2160, 1440), (4992, 3328), (1080, 1440),
+            (1440, 1920), (2160, 2880), (3584, 4800), (1440, 1080), (1920, 1440),
+            (2880, 2160), (4800, 3584), (1080, 1920), (1920, 1080), (1024, 2187),
+            (2187, 1024),
+        ),
+        key=lambda wh: (wh[0] * wh[1], wh[0]),
+    )
+)
+
+# `WxH` / `W:H` / `W*H` tokens. Both sides >= 64 means pixels, anything smaller
+# means an aspect ratio, which is what lets "1024x1024" and "1:1" both work.
+_DIMENSIONS_RE = re.compile(
+    r"(?<![\w.])(\d{1,4})\s*([:x×*])\s*(\d{1,4})(?![\w.])", re.IGNORECASE
+)
+_DIMENSIONS_BY_RE = re.compile(
+    r"(?<![\w.])(\d{1,2})\s+by\s+(\d{1,2})(?![\w.])", re.IGNORECASE
+)
+
+# Markdown image links, used to recover pictures from earlier turns. This has to
+# match plain `http(s)` targets, not just inline base64: images this function
+# generated are rendered as remote links, and those are exactly the references a
+# follow-up like "change the colour" needs to find.
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)>?\s*\)")
+
+# Word-based aspect hints. Numeric ratios are handled by _DIMENSIONS_RE, so
+# these entries only need the vocabulary. English + Indonesian, since the
+# plugin is driven from Indonesian prompts as well.
+_ASPECT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "21:9": (
+        r"\bultra[\s-]?wide\b",
+        r"\bultra\s+lebar\b",
+        r"\bsinemascope\b",
+    ),
+    "16:9": (
+        r"\bwide[\s-]?screen\b",
+        r"\blayar\s+lebar\b",
+        r"\bthumbnail\b",
+        r"\byoutube\b",
+        r"\bdesktop\s+wallpaper\b",
+        r"\b16\s*:\s*9\b",
+    ),
+    "3:2": (r"\b3\s*:\s*2\b",),
+    "4:3": (r"\b4\s*:\s*3\b",),
+    "5:4": (r"\b5\s*:\s*4\b",),
+    "1:1": (
+        r"\b1\s*:\s*1\b",
+        r"\bsquare\b",
+        r"\bpersegi\b",
+        r"\bavatar\b",
+        r"\bprofile\s+picture\b",
+        r"\bfoto\s+profil\b",
+    ),
+    # 4:5 is what a portrait social post usually means, so it is inferred.
+    "4:5": (
+        r"\b4\s*:\s*5\b",
+        r"\binstagram\s+post\b",
+        r"\bfeed\s+post\b",
+        r"\bportrait\s+post\b",
+    ),
+    "3:4": (r"\b3\s*:\s*4\b",),
+    "2:3": (r"\b2\s*:\s*3\b",),
+    "9:16": (
+        r"\b9\s*:\s*16\b",
+        r"\bstory\b",
+        r"\breels\b",
+        r"\bshorts\b",
+        r"\btiktok\b",
+        r"\bvertikal\b",
+        r"\binstagram\s+story\b",
+    ),
+    "1:2": (r"\b1\s*:\s*2\b",),
+}
+
+# Orientation words are weaker evidence than any ratio keyword: they are only
+# consulted when nothing else matched, and a portrait cue beats a wide cue.
+_ORIENTATION_PATTERNS: Tuple[Tuple[str, str, int], ...] = (
+    ("9:16", r"\b(?:vertical|vertikal|portrait)\b", 0),
+    ("16:9", r"\b(?:horizontal|landscape|lanskap)\b", 1),
+)
+
+
+def _nearest_aspect(
+    value: float, candidates: Optional[Tuple[str, ...]] = None
+) -> str:
+    """Map any width/height float onto the closest canonical ratio."""
+    if value <= 0:
+        return "1:1"
+    names = candidates if candidates is not None else tuple(ASPECT_RATIOS)
+    best, best_score = names[0], float("inf")
+    for name in names:
+        score = abs(math.log(ASPECT_RATIOS[name] / value))
+        if score < best_score:
+            best, best_score = name, score
+    return best
+
+
+def _snap_to_multiple(value: float, multiple: int = 8, minimum: int = 8) -> int:
+    """Round to the nearest multiple, half-up, so ratios stay accurate."""
+    return max(minimum, int(math.floor(value / multiple + 0.5) * multiple))
+
+
+def _pixels_for_ratio(ratio: float, target_area: int) -> Tuple[int, int]:
+    """Build a WxH whose width/height is `ratio` and whose area is `target_area`.
+
+    Orientation is preserved: a portrait ratio such as 9:16 yields a WxH that is
+    taller than it is wide.
+    """
+    w = _snap_to_multiple(math.sqrt(target_area * ratio))
+    h = _snap_to_multiple(math.sqrt(target_area / ratio))
+    return w, h
+
+
+def _fit_area(
+    w: int,
+    h: int,
+    low: int,
+    high: int,
+    min_side: int = 8,
+) -> Tuple[int, int]:
+    """Nudge the longer side until the pixel count lands inside [low, high]."""
+    for _ in range(64):
+        area = w * h
+        if low <= area <= high:
+            break
+        if area > high:
+            step = -8
+        else:
+            step = 8
+        if w >= h:
+            w = max(min_side, w + step)
+        else:
+            h = max(min_side, h + step)
+    return w, h
+
+
+def _snap_to_preset(
+    ratio: float, target_area: int, presets: Tuple[Tuple[int, int], ...]
+) -> Tuple[int, int]:
+    """Choose the preset whose ratio is closest, breaking ties on pixel count."""
+    best, best_score = presets[0], None
+    for w, h in presets:
+        score = (abs(math.log((w / h) / ratio)), abs(w * h - target_area))
+        if best_score is None or score < best_score:
+            best, best_score = (w, h), score
+    return best
+
+
+@dataclass
+class OutputSpec:
+    """Resolved output geometry for a single request.
+
+    `kind` is "pixels" (families taking WxH), "aspect" (families taking an
+    aspect_ratio string) or "tier" (no ratio was requested, so the model is
+    left to pick the shape itself).
+    """
+
+    kind: str
+    value: str
+    aspect: Optional[str] = None
+    source: str = "default"
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+    @property
+    def status_value(self) -> str:
+        if self.aspect:
+            return f"{self.value} ({self.aspect})"
+        return self.value
+
+
+def _classify_dimensions(first: int, second: int) -> Tuple[str, Any]:
+    """Classify a `a:b` token as a pixel size or as an aspect ratio."""
+    if first <= 0 or second <= 0:
+        return ("none", None)
+    if first >= 64 and second >= 64:
+        return ("pixels", (first, second))
+    return ("aspect", _nearest_aspect(first / second))
+
+
+def detect_dimensions(prompt: str) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+    """Scan a prompt for an explicit size, in precedence order.
+
+    Returns `(aspect, pixels)`. Exactly one of the two is normally set; both
+    are None when the prompt states no geometry at all.
+
+    The tiers, strongest first:
+      1. any numeric `a:b` / `axb` / `a by b` token (earliest wins),
+      2. ratio vocabulary such as "square" or "story" (earliest wins),
+      3. bare orientation words such as "portrait".
+    """
+    text = (prompt or "").lower()
+
+    # 1. Numeric tokens. This is what makes "1024x1024" and "1:1" agree with
+    #    each other instead of feeding two different detectors.
+    matches: List[Tuple[int, str, Any]] = []
+    for match in _DIMENSIONS_RE.finditer(text):
+        kind, value = _classify_dimensions(int(match.group(1)), int(match.group(3)))
+        if kind != "none":
+            matches.append((match.start(), kind, value))
+    for match in _DIMENSIONS_BY_RE.finditer(text):
+        kind, value = _classify_dimensions(int(match.group(1)), int(match.group(2)))
+        if kind != "none":
+            matches.append((match.start(), kind, value))
+    if matches:
+        matches.sort(key=lambda item: item[0])
+        kind, value = matches[0][1], matches[0][2]
+        return (value, None) if kind == "aspect" else (None, value)
+
+    # 2. Ratio vocabulary.
+    keyword_hits: List[Tuple[int, str]] = []
+    for aspect, patterns in _ASPECT_KEYWORDS.items():
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                keyword_hits.append((match.start(), aspect))
+                break
+    if keyword_hits:
+        keyword_hits.sort(key=lambda item: item[0])
+        return keyword_hits[0][1], None
+
+    # 3. Orientation, with portrait winning a positional tie.
+    orientation_hits: List[Tuple[int, int, str]] = []
+    for aspect, pattern, priority in _ORIENTATION_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            orientation_hits.append((match.start(), priority, aspect))
+    if orientation_hits:
+        orientation_hits.sort(key=lambda item: (item[0], item[1]))
+        return orientation_hits[0][2], None
+
+    return None, None
+
+
+def detect_resolution_tier(prompt: str) -> Optional[str]:
+    """Find a resolution tier such as "4K" or "2k resolution" in a prompt."""
+    text = (prompt or "").lower()
+    match = re.search(r"(?<![\w.])(\d+(?:\.\d+)?)\s*k\b(?![\w])", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    known = sorted(TIER_PIXEL_BUDGET)
+    for tier in known:
+        if abs(float(tier.rstrip("kK")) - value) < 0.01:
+            return tier
+    return None
+
 GENERATION_AND_EDITING_FAMILIES = {
     "hunyuan",
     "hunyuan-v3.5",
     "seedream",
     "vidu",
-    "kling",
     "wand",
     "unknown",
 }
@@ -149,8 +470,6 @@ def _model_family(model: str) -> str:
         return "seedream"
     if "vidu" in m:
         return "vidu"
-    if "kling-image" in m:
-        return "kling"
     if "wand-vega" in m or "vega" in m:
         return "wand"
     return "unknown"
@@ -166,8 +485,6 @@ def _family_endpoint(family: str) -> str:
         return "/v1/wand/si-image/generation"
     if family == "vidu":
         return "/v1/wand/vidu-image/generation"
-    if family == "kling":
-        return "/v1/wand/kling-image/generation"
     if family == "wand":
         return "/v1/wand/vega-images/generations"
     raise ValueError(f"No known TokenHub endpoint for model family '{family}'")
@@ -180,8 +497,6 @@ def _family_is_async(family: str) -> bool:
 def _family_task_endpoint(family: str, task_id: str) -> str:
     if family == "vidu":
         return f"/v1/wand/vidu-image/tasks/{task_id}"
-    if family == "kling":
-        return f"/v1/wand/kling-image/tasks/{task_id}"
     if family == "wand":
         return f"/v1/wand/vega-images/tasks/{task_id}"
     raise ValueError(f"Family '{family}' has no task endpoint")
@@ -198,8 +513,6 @@ def _max_reference_images(model: str) -> int:
         return 10 if "lite" not in model else 14
     if family == "vidu":
         return 7
-    if family == "kling":
-        return 10
     if family == "wand":
         return 3 if "lite" in model else 6
     return 3
@@ -213,8 +526,6 @@ def _max_prompt_chars(model: str) -> int:
         return 600
     if family in ("vidu", "wand"):
         return 2000
-    if family == "kling":
-        return 2500
     return 4096
 
 
@@ -240,8 +551,8 @@ def _size_is_valid(model: str, size: str) -> bool:
     if not size:
         return False
     family = _model_family(model)
-    if family in ("vidu", "kling"):
-        return True  # these families use aspect ratio instead of pixels
+    if family == "vidu":
+        return True  # this family uses aspect ratio instead of pixels
     if family in ("hunyuan", "hunyuan-v3.5"):
         parsed = _parse_size(size)
         if not parsed:
@@ -305,8 +616,7 @@ class Pipe:
                 "Hunyuan: hy-image-v3, hy-image-v3.5-preview\n"
                 "WAND-Vega: wand-vega-image-lite, wand-vega-image-flash, wand-vega-image-pro\n"
                 "Seedream (hosted): seedream-image-v5.0-pro, seedream-image-v5.0-lite\n"
-                "Vidu (hosted): vidu-image-q2\n"
-                "Kling (hosted): kling-image-v3, kling-image-o1, kling-image-v3-omni"
+                "Vidu (hosted): vidu-image-q2"
             ),
         )
         name_prefix: str = Field(
@@ -316,29 +626,61 @@ class Pipe:
         default_size: IMAGE_SIZES = Field(
             default="1024x1024",
             description=(
-                "Default output size for generation when no size keyword is "
-                "detected. Seedream v5 also accepts 1K / 1.5K / 2K / 3K / 4K "
-                "tiers. Unsupported values fall back to the family default."
+                "Fallback output geometry for generation when the prompt names "
+                "no size. A WxH value sets the pixel budget used to derive the "
+                "size for the requested ratio; a tier such as 2K / 4K sets the "
+                "resolution. Values outside a family's documented window are "
+                "clamped to it, and ignored entirely by Vidu, which takes an "
+                "aspect ratio and the resolution valve below."
             ),
         )
         editing_size: IMAGE_SIZES = Field(
             default="1024x1024",
             description=(
-                "Default output size for editing when no size keyword is "
-                "detected. Vidu ignores this and uses aspect_ratio instead."
+                "Same as default_size but for editing. Used when the prompt "
+                "names no size and no reference image is attached."
             ),
         )
         vidu_resolution: VIDU_RESOLUTIONS = Field(
             default="1080p",
             description="Vidu-Image-q2 output resolution tier (1080p / 2K / 4K).",
         )
-        kling_resolution: Literal["1K", "2K"] = Field(
-            default="2K",
-            description="Kling-Image output resolution tier (1K / 2K).",
+        default_aspect_ratio: VIDU_ASPECTS = Field(
+            default="16:9",
+            description=(
+                "Aspect ratio for Vidu when the prompt states no geometry. "
+                "'auto' follows the aspect ratio of the first attached image."
+            ),
         )
         enable_size_detection: bool = Field(
             default=True,
-            description="Detect size/aspect ratio from prompt keywords.",
+            description=(
+                "Read the output geometry out of the prompt. Recognises WxH, "
+                "W:H and 'W by H' tokens (English and Indonesian), ratio words "
+                "such as 'square' / 'story' / 'ultrawide', resolution tiers, "
+                "and bare 'portrait' / 'landscape' as a last resort. When off, "
+                "only the fallback valves above are used."
+            ),
+        )
+        reuse_previous_images: bool = Field(
+            default=True,
+            description=(
+                "When the current message has no image attached, reuse the most "
+                "recent image from earlier in the conversation as the reference. "
+                "This is what makes a follow-up like 'change the colour to blue' "
+                "edit the picture that was just produced instead of starting a "
+                "brand new one. Turn it off to always generate from scratch."
+            ),
+        )
+        history_scan_depth: int = Field(
+            default=3,
+            ge=1,
+            le=20,
+            description=(
+                "How many previous messages to search backwards for a reference "
+                "image when the current message has none. 1 looks only at the "
+                "immediately preceding turn."
+            ),
         )
         revise: bool = Field(
             default=True,
@@ -426,6 +768,7 @@ class Pipe:
             "Change the color palette, e.g., 'make the colors warmer and more saturated'.",
             "Let's change the mood of the image, try 'make it more mysterious'.",
             "Hy-Image and Seedream both support reference images: attach a few and describe the scene.",
+            "No need to re-upload: just say 'make the background darker' and the last image is reused.",
             "Try different aspect ratios like 16:9 for widescreen or 9:16 for vertical.",
             "Upload an image to edit it! Just attach a file and describe the changes.",
         ]
@@ -541,34 +884,39 @@ class Pipe:
             "Please use a smaller source image."
         )
 
-    def _extract_images_from_message(
-        self, message: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Extract unique uploaded images from an Open WebUI message."""
-        raw_pil_images: List[Image.Image] = []
+    def _collect_image_refs(self, message: Dict[str, Any]) -> List[str]:
+        """Gather raw image references from a message, in priority order.
 
-        def _add_pil_from_b64_url(data_url: str):
-            try:
-                b64_data = data_url.split(",", 1)[1]
-                image_bytes = base64.b64decode(b64_data, validate=True)
-                pil_img = Image.open(io.BytesIO(image_bytes))
-                pil_img.load()
-                raw_pil_images.append(pil_img)
-            except Exception as e:
-                print(f"DEBUG: Error processing image: {e}")
+        Both inline `data:` URLs and remote `http(s)` URLs are collected, so a
+        message that merely links to a picture still counts as a reference.
+        """
+        refs: List[str] = []
 
-        def _add_from_string(value: str):
+        def _add(value: Any) -> None:
             if not isinstance(value, str):
                 return
-            if value.startswith("data:image"):
-                _add_pil_from_b64_url(value)
+            value = value.strip()
+            if not value:
+                return
+            if value.startswith(("data:image", "http://", "https://")):
+                if value not in refs:
+                    refs.append(value)
 
         for file_item in message.get("files", []) or []:
             if isinstance(file_item, dict):
-                _add_from_string(file_item.get("data", ""))
+                _add(file_item.get("data", ""))
+                _add(file_item.get("url", ""))
+            else:
+                _add(file_item)
 
         for image_item in message.get("images", []) or []:
-            _add_from_string(image_item)
+            if isinstance(image_item, dict):
+                _add(image_item.get("url", ""))
+                _add(image_item.get("image_url", ""))
+                if isinstance(image_item.get("image_url"), dict):
+                    _add(image_item["image_url"].get("url", ""))
+            else:
+                _add(image_item)
 
         content = message.get("content", "")
         if isinstance(content, list):
@@ -576,154 +924,347 @@ class Pipe:
                 if not isinstance(item, dict):
                     continue
                 if item.get("type") == "image_url":
-                    _add_from_string(item.get("image_url", {}).get("url", ""))
+                    image_url = item.get("image_url", {})
+                    _add(image_url.get("url", "") if isinstance(image_url, dict) else image_url)
                 elif "image" in item:
-                    _add_from_string(item["image"])
+                    _add(item["image"])
+        elif isinstance(content, str):
+            for url in _MARKDOWN_IMAGE_RE.findall(content):
+                _add(url.strip().strip("<>"))
 
-        if isinstance(content, str):
-            for data_url in re.findall(
-                r"!\[.*?\]\((data:image/[^;]+;base64,[^)]+)\)", content
-            ):
-                _add_from_string(data_url)
+        return refs
 
-        if not raw_pil_images:
-            return []
+    def _decode_data_url(self, data_url: str) -> Optional[Image.Image]:
+        try:
+            b64_data = data_url.split(",", 1)[1]
+            image_bytes = base64.b64decode(b64_data, validate=True)
+            pil_img = Image.open(io.BytesIO(image_bytes))
+            pil_img.load()
+            return pil_img
+        except Exception as e:
+            print(f"DEBUG: could not decode inline image: {e}")
+            return None
 
+    async def _fetch_remote_image(self, url: str) -> Optional[Image.Image]:
+        """Download a previously generated image so it can be re-encoded."""
+        try:
+            timeout = httpx.Timeout(30, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url, follow_redirects=True)
+            if resp.status_code != 200:
+                print(f"DEBUG: reference image {url} -> HTTP {resp.status_code}")
+                return None
+            if len(resp.content) > self._MAX_B64_BYTES * 3:
+                print(f"DEBUG: reference image {url} is too large to inline")
+                return None
+            pil_img = Image.open(io.BytesIO(resp.content))
+            pil_img.load()
+            return pil_img
+        except Exception as e:
+            print(f"DEBUG: could not download reference image: {e}")
+            return None
+
+    async def _load_reference(
+        self, ref: str, source: str
+    ) -> Optional[Dict[str, Any]]:
+        """Normalise one reference into {ref, pil, source} for the payload."""
+        if ref.startswith("data:image"):
+            pil_img = self._decode_data_url(ref)
+            if pil_img is None:
+                return None
+            return {
+                "ref": self._image_to_base64(pil_img),
+                "pil": pil_img,
+                "source": source,
+            }
+
+        # A remote URL: normally a picture this function generated on an
+        # earlier turn. Inline it when possible so the model definitely gets
+        # the pixels, and otherwise hand the URL over untouched. A failed
+        # download must never abort the request, so it degrades to the URL.
+        try:
+            pil_img = await self._fetch_remote_image(ref)
+        except Exception as e:
+            print(f"DEBUG: reference fetch failed for {ref}: {e}")
+            pil_img = None
+
+        if pil_img is not None:
+            try:
+                return {
+                    "ref": self._image_to_base64(pil_img),
+                    "pil": pil_img,
+                    "source": source,
+                }
+            except Exception as e:
+                print(f"DEBUG: could not re-encode reference image: {e}")
+        return {"ref": ref, "pil": None, "source": source}
+
+    async def _load_references(
+        self, refs: List[str], source: str
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Resolve raw references into deduped, payload-ready images.
+
+        Returns the usable images plus the refs that could not be read, so the
+        caller can tell "nothing here" apart from "something is here but broken".
+        """
+        images: List[Dict[str, Any]] = []
+        unreadable: List[str] = []
         seen: set = set()
-        unique_pils: List[Image.Image] = []
-        for img in raw_pil_images:
-            key = img.tobytes()
-            if key not in seen:
-                seen.add(key)
-                unique_pils.append(img)
+        for ref in refs:
+            image = await self._load_reference(ref, source)
+            if image is None:
+                unreadable.append(ref)
+                continue
+            key = image["ref"][:256]
+            if key in seen:
+                continue
+            seen.add(key)
+            images.append(image)
+        return images, unreadable
 
-        return [
-            {"pil": pil_img, "base64_url": self._image_to_base64(pil_img)}
-            for pil_img in unique_pils
-        ]
+    async def _images_from_message(
+        self, message: Dict[str, Any], source: str = "attached"
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Resolve the images carried by a single message."""
+        return await self._load_references(
+            self._collect_image_refs(message), source
+        )
+
+    async def _resolve_reference_images(
+        self, messages: List[Dict[str, Any]], last_message: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Pick the images this turn should treat as references.
+
+        An image attached to the current message always wins. Only when the
+        turn carries none do we look back through recent history, so a
+        follow-up instruction continues the previous picture. A reference that
+        is present but unreadable raises instead of silently falling back to
+        something else, because quietly editing a different image is worse
+        than saying so.
+        """
+        attached, attached_broken = await self._images_from_message(
+            last_message, "attached"
+        )
+        if attached:
+            return attached, "attached"
+        if attached_broken:
+            # The user did attach something. Editing an older image instead
+            # would be silently wrong, so stop and say so.
+            raise ValueError(
+                "The image attached to this message could not be read "
+                f"({len(attached_broken)} attachment(s) failed to decode). "
+                "Please re-upload it."
+            )
+
+        if not self.valves.reuse_previous_images:
+            return [], None
+
+        depth = max(1, int(self.valves.history_scan_depth))
+        unreadable: List[str] = []
+        for msg in reversed(messages[:-1][-depth:]):
+            refs = self._collect_image_refs(msg)
+            if not refs:
+                continue
+            found, broken = await self._load_references(refs, "previous")
+            if found:
+                origin = (
+                    "previous output"
+                    if msg.get("role") == "assistant"
+                    else "earlier upload"
+                )
+                return found, origin
+            unreadable.extend(refs)
+
+        if unreadable:
+            raise ValueError(
+                "Found an image in this conversation but could not read it "
+                f"({len(unreadable)} reference(s) failed to load). TokenHub "
+                "result links expire after about 12 hours, so please re-upload "
+                "the image you want to edit."
+            )
+        return [], None
 
     # -------------------------------------------------------------------------
     # Size / aspect detection & resolution
     # -------------------------------------------------------------------------
 
-    def _detect_size_from_prompt(self, prompt: str, editing: bool = False) -> str:
-        """Detect a desired pixel size from prompt keywords."""
-        prompt_lower = prompt.lower()
-        default = self.valves.editing_size if editing else self.valves.default_size
-
-        for size, patterns in {
-            "1024x1024": ["1024x1024", "1024*1024"],
-            "2048x2048": ["2048x2048", "2048*2048"],
-            "1280x720": ["1280x720", "1280*720"],
-            "720x1280": ["720x1280", "720*1280"],
-            "1024x768": ["1024x768", "1024*768"],
-            "768x1024": ["768x1024", "768*1024"],
-            "1152x896": ["1152x896", "1152*896"],
-            "896x1152": ["896x1152", "896*1152"],
-            "1344x704": ["1344x704", "1344*704"],
-            "704x1344": ["704x1344", "704*1344"],
-            "1536x512": ["1536x512", "1536*512"],
-            "512x1536": ["512x1536", "512*1536"],
-            "2048x512": ["2048x512", "2048*512"],
-            "512x2048": ["512x2048", "512*2048"],
-            "1920x1080": ["1920x1080", "1920*1080"],
-            "1080x1920": ["1080x1920", "1080*1920"],
-            "1536x1024": ["1536x1024", "1536*1024"],
-            "1024x1536": ["1024x1536", "1024*1536"],
-            "1440x2160": ["1440x2160", "1440*2160"],
-            "2160x1440": ["2160x1440", "2160*1440"],
-            "2560x1440": ["2560x1440", "2560*1440"],
-            "1440x2560": ["1440x2560", "1440*2560"],
-            "4096x4096": ["4096x4096", "4096*4096"],
-            "2K": ["2k resolution", "2k image", "2k", "resolution 2k"],
-            "4K": ["4k resolution", "4k image", "4k", "resolution 4k"],
-        }.items():
-            if any(p in prompt_lower for p in patterns):
-                return size
-
-        vertical_words = ("vertical", "portrait", "tall")
-        ar_map = {
-            (
-                "16:9",
-                "16/9",
-                "widescreen",
-                "landscape",
-                "wide",
-                "banner",
-                "header",
-                "desktop",
-                "monitor",
-            ): ("1280x720", "720x1280"),
-            ("9:16", "9/16", "phone", "mobile", "story", "tiktok", "reels"): (
-                "720x1280",
-                "1280x720",
-            ),
-            ("4:3", "4/3", "four by three"): ("1024x768", "768x1024"),
-            ("3:4", "3/4", "three by four"): ("768x1024", "1024x768"),
-            ("3:2", "3/2", "three by two"): ("1152x896", "896x1152"),
-            ("2:3", "2/3", "two by three"): ("896x1152", "1152x896"),
-            ("21:9", "21/9", "ultrawide", "ultra wide"): ("1536x512", "512x1536"),
-            ("1:1", "square", "instagram post", "profile picture", "avatar"): (
-                "1024x1024",
-                "1024x1024",
-            ),
-        }
-        for keywords, (landscape_size, portrait_size) in ar_map.items():
-            if any(kw in prompt_lower for kw in keywords):
-                if any(v in prompt_lower for v in vertical_words):
-                    return portrait_size
-                return landscape_size
-
-        return default
-
-    def _detect_vidu_aspect(self, prompt: str, editing: bool) -> str:
-        """Detect a Vidu aspect_ratio from prompt keywords."""
-        prompt_lower = prompt.lower()
-        for aspect, keywords in {
-            "1:1": ("1:1", "1/1", "square", "instagram post", "profile picture", "avatar"),
-            "16:9": ("16:9", "16/9", "widescreen", "landscape", "wide", "banner"),
-            "9:16": ("9:16", "9/16", "portrait", "vertical", "phone", "story", "reels"),
-            "4:3": ("4:3", "4/3", "four by three"),
-            "3:4": ("3:4", "3/4", "three by four"),
-            "3:2": ("3:2", "3/2", "three by two"),
-            "2:3": ("2:3", "2/3", "two by three"),
-            "21:9": ("21:9", "21/9", "ultrawide", "ultra wide"),
-        }.items():
-            if any(kw in prompt_lower for kw in keywords):
-                return aspect
-        if editing:
-            return "auto"
-        return "16:9"
-
-    def _normalize_size(self, size: str) -> str:
-        """Normalize '*' separators to 'x' and canonicalize tier case for Tencent."""
-        s = str(size or "").strip()
-        if not s:
-            return s
-        if s.upper() in ("1K", "1.5K", "2K", "3K", "4K"):
-            return s.upper()
-        return s.lower().replace("*", "x")
-
-    def _resolve_size(
-        self, model: str, requested: str, editing: bool
+    def _reference_aspect(
+        self, images: Optional[List[Dict[str, Any]]]
     ) -> Optional[str]:
-        """Return a size valid for the model family, or None to omit `size`."""
+        """Canonical ratio of the first usable reference image."""
+        for image in images or []:
+            pil_image = image.get("pil")
+            width, height = getattr(pil_image, "size", (0, 0))
+            if width and height:
+                return _nearest_aspect(width / height)
+        return None
+
+    def _default_size_valve(self, editing: bool) -> str:
+        return (
+            self.valves.editing_size if editing else self.valves.default_size
+        )
+
+    def _target_area(self, prompt: str, editing: bool) -> int:
+        """Pixel budget for this request: prompt tier first, then the valve.
+
+        This is a target, not a guarantee. It gets clamped into each family's
+        documented area window before a WxH is derived from it.
+        """
+        tier = detect_resolution_tier(prompt)
+        if tier is not None:
+            return TIER_PIXEL_BUDGET[tier]
+        valve = self._default_size_valve(editing)
+        if valve.upper() in TIER_PIXEL_BUDGET:
+            return TIER_PIXEL_BUDGET[valve.upper()]
+        parsed = _parse_size(valve)
+        return parsed[0] * parsed[1] if parsed else TIER_PIXEL_BUDGET["2K"]
+
+    def _resolve_output(
+        self,
+        model: str,
+        prompt: str,
+        editing: bool = False,
+        reference: Optional[str] = None,
+    ) -> OutputSpec:
+        """Turn a prompt into the geometry the target family actually accepts.
+
+        `reference` is the canonical ratio of the first attached image, used as
+        the fallback when editing and the prompt says nothing about geometry.
+        """
         family = _model_family(model)
-        if family in ("vidu", "kling"):
-            # These families are driven by aspect_ratio/resolution, not pixels.
-            return None
+        aspect: Optional[str] = None
+        pixels: Optional[Tuple[int, int]] = None
 
-        req = self._normalize_size(requested)
-        if req and _size_is_valid(model, req):
-            return req
+        if self.valves.enable_size_detection:
+            aspect, pixels = detect_dimensions(prompt)
+            if aspect:
+                source = "prompt"
+            elif pixels:
+                # An explicit WxH still names a ratio, which matters for Vidu,
+                # the one family that only accepts `aspect_ratio`.
+                aspect = _nearest_aspect(pixels[0] / pixels[1])
+                source = "explicit"
+            elif reference:
+                aspect, source = reference, "reference"
+            else:
+                source = "default"
+        elif reference:
+            aspect, source = reference, "reference"
+        else:
+            source = "disabled"
 
-        if family in ("hunyuan", "hunyuan-v3.5"):
-            return "1024x1024"
+        area = self._target_area(prompt, editing)
+
+        # Vidu takes a ratio string, never a pixel size.
+        if family == "vidu":
+            if aspect is None:
+                resolved = self.valves.default_aspect_ratio
+                return OutputSpec("aspect", resolved, resolved, "default")
+            if aspect == "auto":
+                return OutputSpec("aspect", "auto", None, source)
+            if aspect not in HOSTED_ASPECTS:
+                # 4:5 / 5:4 / 1:2 are outside the Vidu enum, so snap them in
+                # rather than letting the API reject the request.
+                snapped = _nearest_aspect(ASPECT_RATIOS[aspect], HOSTED_ASPECTS)
+                return OutputSpec("aspect", snapped, aspect, "snapped")
+            return OutputSpec("aspect", aspect, aspect, source)
+
+        # A pixel size the user typed that the family accepts is used verbatim.
+        if pixels is not None:
+            explicit = f"{pixels[0]}x{pixels[1]}"
+            if _size_is_valid(model, explicit):
+                return OutputSpec(
+                    "pixels",
+                    explicit,
+                    _nearest_aspect(pixels[0] / pixels[1]),
+                    "explicit",
+                )
+
+        # No ratio was stated: hand over a resolution tier and let the model
+        # choose the shape. This is the documented Seedream / Hy-3.5 behaviour
+        # and avoids forcing a square onto a prompt that never asked for one.
+        if aspect is None:
+            tier = self._resolve_tier(model, prompt, editing)
+            if family == "wand":
+                # WAND only ever accepts concrete preset sizes, never a tier.
+                w, h = _snap_to_preset(1.0, TIER_PIXEL_BUDGET[tier], WAND_PRESET_PAIRS)
+                return OutputSpec("pixels", f"{w}x{h}", None, source)
+            return OutputSpec("tier", tier, None, source)
+
+        # Otherwise derive a valid WxH that honours the requested ratio.
+        if family == "hunyuan":
+            w, h = _snap_to_preset(ASPECT_RATIOS[aspect], area, HUNYUAN_V3_PRESET_SIZES)
+            return OutputSpec("pixels", f"{w}x{h}", aspect, source)
+
+        if family == "hunyuan-v3.5":
+            # Sides 256..8192, area capped at 4096x4096.
+            w, h = self._derive_pixels(
+                ASPECT_RATIOS[aspect], area, 256 * 256, 4096 * 4096, 256
+            )
+            return OutputSpec("pixels", f"{w}x{h}", aspect, source)
+
         if family == "seedream":
-            return "2K"
+            # Each Seedream variant has its own total-pixel window; the requested
+            # area is clamped into it before a WxH is derived.
+            low, high = SEEDREAM_PIXEL_RANGE.get(model, (921600, 16777216))
+            w, h = self._derive_pixels(ASPECT_RATIOS[aspect], area, low, high, 64)
+            return OutputSpec("pixels", f"{w}x{h}", aspect, source)
+
         if family == "wand":
-            return "1024x1024"
-        return req or "1024x1024"
+            w, h = _snap_to_preset(ASPECT_RATIOS[aspect], area, WAND_PRESET_PAIRS)
+            return OutputSpec("pixels", f"{w}x{h}", aspect, source)
+
+        return OutputSpec("tier", self._default_tier(model, editing), aspect, source)
+
+    @staticmethod
+    def _derive_pixels(
+        ratio: float, area: int, low: int, high: int, min_side: int
+    ) -> Tuple[int, int]:
+        """Derive a WxH for `ratio` that lands inside the family's area window.
+
+        Clamping the target area *before* deriving matters: Seedream-lite has a
+        3.6 MP floor, so a 1:1 request asked for at 1 MP has to be scaled up or
+        the API rejects the request outright.
+        """
+        target = min(max(area, low), high)
+        w, h = _pixels_for_ratio(ratio, target)
+        return _fit_area(w, h, low, high, min_side)
+
+    def _default_tier(self, model: str, editing: bool) -> str:
+        """Resolution tier to fall back on when the prompt names no geometry."""
+        family = _model_family(model)
+        valve = self._default_size_valve(editing).upper()
+        allowed = self._allowed_tiers(model)
+        if valve in TIER_PIXEL_BUDGET:
+            return self._clamp_tier(valve, allowed)
+        if allowed:
+            # 2K is the documented default for both Seedream variants.
+            return "2K" if "2K" in allowed else sorted(allowed)[0]
+        return "1.5K" if family == "hunyuan-v3.5" else "2K"
+
+    def _resolve_tier(self, model: str, prompt: str, editing: bool) -> str:
+        """Resolution tier for this request: prompt tier, then valve, then default."""
+        requested = detect_resolution_tier(prompt)
+        if requested is not None:
+            return self._clamp_tier(requested, self._allowed_tiers(model))
+        return self._default_tier(model, editing)
+
+    @staticmethod
+    def _allowed_tiers(model: str) -> Optional[set]:
+        """Tiers a family actually accepts, or None when it takes any tier."""
+        if _model_family(model) != "seedream":
+            return None
+        return SEEDREAM_LITE_TIERS if "lite" in model else SEEDREAM_PRO_TIERS
+
+    @staticmethod
+    def _clamp_tier(tier: str, allowed: Optional[set]) -> str:
+        """Pull a tier into the supported set by pixel count, e.g. 4K -> 2K for pro."""
+        if not allowed or tier in allowed:
+            return tier
+        target = TIER_PIXEL_BUDGET.get(tier)
+        if target is None:
+            return sorted(allowed)[0]
+        return min(allowed, key=lambda t: abs(TIER_PIXEL_BUDGET[t] - target))
 
     # -------------------------------------------------------------------------
     # TokenHub API client
@@ -853,22 +1394,17 @@ class Pipe:
         self, model: str, task_id: str, emitter=None, poll_interval: float = 3.0
     ) -> Dict[str, Any]:
         """Poll an async TokenHub task until it succeeds, fails, or times out."""
-        family = _model_family(model)
-        url = self._api_url(_family_task_endpoint(family, task_id))
+        url = self._api_url(
+            _family_task_endpoint(_model_family(model), task_id)
+        )
         max_attempts = 100
 
         # Vidu: created/queueing/processing/success/failed  -> success
         # WAND:  queued/in_progress/completed/failed/cancelled/incomplete -> completed
-        # Kling: top-level or wrapped data[].status  processing/succeeded/failed
-        if family == "vidu":
-            done_statuses = {"success"}
-            fail_statuses = {"failed"}
-        elif family == "kling":
-            done_statuses = {"succeeded", "success", "succeed"}
-            fail_statuses = {"failed", "cancelled", "canceled"}
-        else:
-            done_statuses = {"completed"}
-            fail_statuses = {"failed", "cancelled", "incomplete"}
+        # The success spelling drifts between the upstream vendors, so every
+        # family accepts each of them rather than timing out on a live task.
+        done_statuses = {"success", "succeeded", "succeed", "completed"}
+        fail_statuses = {"failed", "cancelled", "canceled", "incomplete"}
 
         for attempt in range(max_attempts):
             data = await self._get_json(url)
@@ -878,7 +1414,7 @@ class Pipe:
                 or data.get("task_status")
                 or "UNKNOWN"
             ).lower()
-            # Kling wraps tasks in a data[] array with per-item status
+            # Some families wrap the task in a data[] array with a per-item status
             if status == "unknown":
                 items = data.get("data", [])
                 if isinstance(items, list) and items:
@@ -945,36 +1481,21 @@ class Pipe:
         self,
         model: str,
         prompt: str,
-        size: Optional[str],
-        base64_images: Optional[List[str]] = None,
-        editing: bool = False,
+        spec: OutputSpec,
+        reference_images: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Build a per-family payload for a TokenHub image model."""
         family = _model_family(model)
         prompt = self._clamp_prompt(model, prompt)
-        images = base64_images or []
+        # Each entry is a {"ref": data-or-http URL, "pil": ...} mapping.
+        images = [image["ref"] for image in (reference_images or [])]
 
         if family == "vidu":
-            aspect = self._detect_vidu_aspect(prompt, editing)
             payload: Dict[str, Any] = {
                 "model": model,
                 "prompt": prompt,
-                "aspect_ratio": aspect,
+                "aspect_ratio": spec.value,
                 "resolution": self.valves.vidu_resolution,
-            }
-            if images:
-                payload["images"] = images[: _max_reference_images(model)]
-            if self.valves.seed > 0:
-                payload["seed"] = self.valves.seed
-            return payload
-
-        if family == "kling":
-            aspect = self._detect_vidu_aspect(prompt, editing)
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "aspect_ratio": aspect,
-                "resolution": self.valves.kling_resolution,
             }
             if images:
                 payload["images"] = images[: _max_reference_images(model)]
@@ -990,12 +1511,14 @@ class Pipe:
                 "model": model,
                 "messages": [{"role": "user", "content": content}],
             }
-            if size:
-                s = self._normalize_size(size)
-                if s in ("1K", "1.5K", "2K"):
-                    payload["generate_max_pixels"] = s
-                else:
-                    payload["size"] = s
+            if spec.kind == "pixels":
+                payload["size"] = spec.value
+            else:
+                # generate_max_pixels is an integer pixel budget, not a tier
+                # string, and it only applies while `size` is absent.
+                payload["generate_max_pixels"] = TIER_PIXEL_BUDGET.get(
+                    spec.value, 2359296
+                )
             if self.valves.seed > 0:
                 payload["seed"] = self.valves.seed
             footnote = (self.valves.footnote or "").strip()
@@ -1007,8 +1530,8 @@ class Pipe:
             payload = {"model": model, "prompt": prompt}
             if images:
                 payload["images"] = images[: _max_reference_images(model)]
-            if size:
-                payload["size"] = self._normalize_size(size)
+            if spec.kind == "pixels":
+                payload["size"] = spec.value
             if self.valves.seed > 0:
                 payload["seed"] = self.valves.seed
             payload["revise"] = bool(self.valves.revise)
@@ -1021,8 +1544,8 @@ class Pipe:
             payload = {"model": model, "prompt": prompt}
             if images:
                 payload["images"] = images[: _max_reference_images(model)]
-            if size:
-                payload["size"] = self._normalize_size(size)
+            if spec.kind in ("pixels", "tier"):
+                payload["size"] = spec.value
             payload["output_format"] = self.valves.seedream_output_format
             payload["response_format"] = "url"
             if self.valves.watermark:
@@ -1048,69 +1571,30 @@ class Pipe:
                         ]
                     }
                 ]
-            if size:
-                payload["size"] = self._normalize_size(size)
+            if spec.kind == "pixels":
+                payload["size"] = spec.value
             return payload
 
         raise ValueError(f"Unsupported model family for {model}")
 
-    async def _call_kling(
-        self, payload: Dict[str, Any], model: str, emitter=None
+    async def _run_image_request(
+        self,
+        model: str,
+        prompt: str,
+        spec: OutputSpec,
+        reference_images: Optional[List[Dict[str, Any]]] = None,
+        emitter=None,
     ) -> List[str]:
-        """Kling-Image: return URLs directly if synchronous, else poll the task."""
-        endpoint = _family_endpoint("kling")
-        await self._rate_limit(self.valves.min_request_interval)
-        result = await self._post_json(self._api_url(endpoint), payload)
-
-        urls = self._extract_task_urls(model, result)
-        if urls:
-            return urls
-
-        data = result.get("data")
-        task_id = (
-            result.get("task_id")
-            or result.get("id")
-            or (data.get("id") if isinstance(data, dict) else None)
-            or (data.get("task_id") if isinstance(data, dict) else None)
-        )
-        if not task_id and isinstance(data, list) and data and isinstance(data[0], dict):
-            task_id = data[0].get("id") or data[0].get("task_id")
-        if not task_id and isinstance(result, dict) and result:
-            for key in ("result", "task", "job_id"):
-                nested = result.get(key)
-                if isinstance(nested, dict):
-                    task_id = nested.get("id") or nested.get("task_id")
-                    if task_id:
-                        break
-        if not task_id:
-            raise ValueError(
-                "Kling returned no image URLs or task id: "
-                f"{json.dumps(result, default=str)}"
-            )
-
-        polled = await self._poll_task(model, str(task_id), emitter)
-        urls = self._extract_task_urls(model, polled)
-        if not urls:
-            raise ValueError(
-                "No image URLs found in Kling task result: "
-                f"{json.dumps(polled, default=str)}"
-            )
-        return urls
-
-    async def _generate_image(
-        self, model: str, prompt: str, size: Optional[str], emitter=None
-    ) -> List[str]:
-        """Generate images from a text prompt. Returns image URLs."""
-        payload = self._build_payload(model, prompt, size, editing=False)
+        """Shared generate/edit path: build the payload, submit, resolve URLs."""
+        payload = self._build_payload(model, prompt, spec, reference_images)
         family = _model_family(model)
         endpoint = _family_endpoint(family)
         print(
-            f"DEBUG: [GENERATE] model={model}, size={size}, "
-            f"endpoint={endpoint}"
+            f"DEBUG: [{'EDIT' if reference_images else 'GENERATE'}] "
+            f"model={model}, spec={spec.kind}={spec.value} "
+            f"(aspect={spec.aspect}, source={spec.source}), "
+            f"images={len(reference_images or [])}, endpoint={endpoint}"
         )
-
-        if family == "kling":
-            return await self._call_kling(payload, model, emitter)
 
         if _family_is_async(family):
             task_id = await self._submit_task(payload, endpoint)
@@ -1126,43 +1610,25 @@ class Pipe:
         await self._rate_limit(self.valves.min_request_interval)
         result = await self._post_json(self._api_url(endpoint), payload)
         return self._extract_all_image_urls(result)
+
+    async def _generate_image(
+        self, model: str, prompt: str, spec: OutputSpec, emitter=None
+    ) -> List[str]:
+        """Generate images from a text prompt. Returns image URLs."""
+        return await self._run_image_request(model, prompt, spec, None, emitter)
 
     async def _edit_image(
         self,
         model: str,
         prompt: str,
-        base64_images: List[str],
-        size: Optional[str],
+        reference_images: List[Dict[str, Any]],
+        spec: OutputSpec,
         emitter=None,
     ) -> List[str]:
         """Edit one or more reference images. Returns image URLs."""
-        payload = self._build_payload(
-            model, prompt, size, base64_images=base64_images, editing=True
+        return await self._run_image_request(
+            model, prompt, spec, reference_images, emitter
         )
-        family = _model_family(model)
-        endpoint = _family_endpoint(family)
-        print(
-            f"DEBUG: [EDIT] model={model}, size={size}, "
-            f"images={len(base64_images)}, endpoint={endpoint}"
-        )
-
-        if family == "kling":
-            return await self._call_kling(payload, model, emitter)
-
-        if _family_is_async(family):
-            task_id = await self._submit_task(payload, endpoint)
-            result = await self._poll_task(model, task_id, emitter)
-            urls = self._extract_task_urls(model, result)
-            if not urls:
-                raise ValueError(
-                    "No image URLs found in task result: "
-                    f"{json.dumps(result, default=str)}"
-                )
-            return urls
-
-        await self._rate_limit(self.valves.min_request_interval)
-        result = await self._post_json(self._api_url(endpoint), payload)
-        return self._extract_all_image_urls(result)
 
     # -------------------------------------------------------------------------
     # Response parsing
@@ -1257,11 +1723,22 @@ class Pipe:
     # Rendering / errors
     # -------------------------------------------------------------------------
 
-    def _render(self, model: str, urls: List[str], size: Optional[str], editing: bool) -> str:
+    def _render(
+        self,
+        model: str,
+        urls: List[str],
+        spec: OutputSpec,
+        editing: bool,
+        reference_origin: Optional[str] = None,
+    ) -> str:
         label = "edited" if editing else "generated"
         header = f"**✏️ Here is your {label} image:**\n" if editing else (
             "**🖼️ Here is your generated image:**\n"
         )
+        if editing and reference_origin:
+            # Makes it obvious that this turn continued an earlier picture
+            # rather than starting over, which is otherwise easy to misread.
+            header += f"*(edited from your {reference_origin})*\n"
 
         blocks: List[str] = []
         for idx, url in enumerate(urls, start=1):
@@ -1271,16 +1748,21 @@ class Pipe:
                 caption = "Edited Image" if editing else "Generated Image"
             blocks.append(f"![{caption}]({url})")
 
-        if _model_family(model) in ("vidu", "kling"):
-            shown_size = f"{self._detect_vidu_aspect('', editing)}"
+        if spec.kind == "aspect":
             meta = (
-                f"**Aspect:** `{shown_size}` | **Model:** `{model}` | "
+                f"**Aspect:** `{spec.value}` | **Resolution:** "
+                f"`{self.valves.vidu_resolution}` | **Model:** `{model}` | "
                 f"**Outputs:** `{len(urls)}`"
             )
-        else:
-            shown_size = size or "auto"
+        elif spec.kind == "tier":
             meta = (
-                f"**Size:** `{shown_size}` | **Model:** `{model}` | "
+                f"**Size:** `{spec.value}` (model picks the ratio) | "
+                f"**Model:** `{model}` | **Outputs:** `{len(urls)}`"
+            )
+        else:
+            ratio = f" · **Aspect:** `{spec.aspect}`" if spec.aspect else ""
+            meta = (
+                f"**Size:** `{spec.value}`{ratio} | **Model:** `{model}` | "
                 f"**Outputs:** `{len(urls)}`"
             )
         tip = random.choice(self.tooltips)
@@ -1332,13 +1814,12 @@ class Pipe:
                 yield self._error("No text prompt found in the last message.")
                 return
 
-            images = self._extract_images_from_message(last_message)
-            if not images:
-                for msg in reversed(messages[:-1]):
-                    found = self._extract_images_from_message(msg)
-                    if found:
-                        images = found
-                        break
+            # An image on this message wins; otherwise continue the most recent
+            # picture from the conversation so "change the colour to blue" edits
+            # the previous result instead of generating a brand new image.
+            images, reference_origin = await self._resolve_reference_images(
+                messages, last_message
+            )
 
             is_editing = bool(images)
             family = _model_family(model)
@@ -1346,56 +1827,48 @@ class Pipe:
             if family == "unknown":
                 yield self._error(
                     f"Model `{model}` does not match any known TokenHub image "
-                    "family (Hunyuan, Seedream, Vidu, Kling, WAND-Vega)."
+                    "family (Hunyuan, Seedream, Vidu, WAND-Vega)."
                 )
                 return
 
-            if self.valves.enable_size_detection:
-                detected = self._detect_size_from_prompt(
-                    user_prompt, editing=is_editing
-                )
-            else:
-                detected = (
-                    self.valves.editing_size if is_editing else self.valves.default_size
-                )
-            size = self._resolve_size(model, detected, is_editing)
+            spec = self._resolve_output(
+                model,
+                user_prompt,
+                editing=is_editing,
+                reference=self._reference_aspect(images) if is_editing else None,
+            )
 
             if __event_emitter__:
-                if family in ("vidu", "kling"):
-                    aspect = self._detect_vidu_aspect(user_prompt, is_editing)
-                    resolution = (
-                        self.valves.vidu_resolution
-                        if family == "vidu"
-                        else self.valves.kling_resolution
-                    )
-                    status = (
-                        f"✏️ Editing image ({aspect}, {resolution}) using {model}…"
-                        if is_editing
-                        else f"🎨 Generating image ({aspect}, {resolution}) "
-                        f"using {model}…"
-                    )
+                if spec.kind == "aspect":
+                    detail = f"{spec.value}, {self.valves.vidu_resolution}"
                 else:
-                    shown_size = size or "auto"
-                    status = (
-                        f"✏️ Editing image at {shown_size} using {model}…"
-                        if is_editing
-                        else f"🎨 Generating image at {shown_size} using {model}…"
-                    )
+                    detail = spec.status_value
+                verb = "Editing" if is_editing else "Generating"
                 await __event_emitter__(
-                    {"type": "status", "data": {"description": status, "done": False}}
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": (
+                                f"{'✏️' if is_editing else '🎨'} {verb} image "
+                                f"({detail}) using {model}…"
+                            ),
+                            "done": False,
+                        },
+                    }
                 )
 
             if is_editing:
-                base64_urls = [img["base64_url"] for img in images]
                 urls = await self._edit_image(
-                    model, user_prompt, base64_urls, size, __event_emitter__
+                    model, user_prompt, images, spec, __event_emitter__
                 )
             else:
                 urls = await self._generate_image(
-                    model, user_prompt, size, __event_emitter__
+                    model, user_prompt, spec, __event_emitter__
                 )
 
-            yield self._render(model, urls, size, is_editing)
+            yield self._render(
+                model, urls, spec, is_editing, reference_origin
+            )
 
             if __event_emitter__:
                 await __event_emitter__(
