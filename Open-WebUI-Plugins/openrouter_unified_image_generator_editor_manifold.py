@@ -1,11 +1,13 @@
 """
 title: OpenRouter Unified Image Generator & Editor (Manifold)
 author: adapted from dfirmans' WAN pipe
-version: 3.1.0
+version: 3.2.0
 description: >
   Unified Pipe for image generation and editing in Open WebUI via OpenRouter.
   Uses the dedicated OpenRouter Image API (`/api/v1/images`) for both
   text-to-image and image-to-image/reference workflows.
+  Request parameters are adapted per model using `/api/v1/images/models`
+  (unsupported parameters are dropped, values are clamped to what the model accepts).
   This is a manifold pipe: set `models` to a comma-separated list of OpenRouter
   model IDs and each one will appear as a selectable model in Open WebUI.
 required_open_webui_version: 0.11.4
@@ -14,14 +16,40 @@ requirements: httpx
 
 import re
 import json
+import math
 import time
-import uuid
 import random
-from typing import AsyncGenerator, List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from typing import AsyncGenerator, List, Dict, Any, Optional, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
 from fastapi import Request
+
+
+class OpenRouterHTTPError(Exception):
+    """Non-200 response from OpenRouter, with the status code kept for decisions."""
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"OpenRouter HTTP {status_code}: {message}")
+
+
+@dataclass
+class ImageRequest:
+    model_id: str
+    prompt: str
+    input_images: List[str]
+    aspect_ratio: Optional[str]
+    resolution: Optional[str]
+    size: Optional[str]
+    entry: Optional[Dict[str, Any]] = None
+    skip_image_api: bool = False
+    session_id: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+    sent_ratio: Optional[str] = None
+    sent_resolution: Optional[str] = None
 
 
 class Pipe:
@@ -44,12 +72,15 @@ class Pipe:
         )
         models: str = Field(
             default=(
+                "google/gemini-nano-banana-2.1, "
                 "google/gemini-3.1-flash-image, "
                 "google/gemini-3.1-flash-lite-image, "
                 "google/gemini-2.5-flash-image, "
                 "google/gemini-3-pro-image, "
                 "openai/gpt-image-2, "
+                "black-forest-labs/flux-3-image, "
                 "black-forest-labs/flux.2-pro, "
+                "bytedance-seed/seedream-5-0-flash, "
                 "bytedance-seed/seedream-5-0-pro, "
                 "qwen/qwen-image-3"
             ),
@@ -66,8 +97,22 @@ class Pipe:
         enable_legacy_chat_fallback: bool = Field(
             default=False,
             description=(
-                "Fallback to legacy /chat/completions path if dedicated Image API fails."
+                "Fallback to legacy /chat/completions path if the model is not served "
+                "by the dedicated Image API. Never triggered for auth, billing, rate-limit "
+                "or timeout errors, to avoid paying twice."
             ),
+        )
+        enable_capability_filtering: bool = Field(
+            default=True,
+            description=(
+                "Fetch /api/v1/images/models and adapt each request to the model: "
+                "drop unsupported parameters and clamp aspect ratio, resolution, n and "
+                "number of reference images to what the model accepts."
+            ),
+        )
+        capabilities_cache_ttl: int = Field(
+            default=3600,
+            description="Seconds to cache the /images/models capability list.",
         )
         legacy_modalities: str = Field(
             default="image,text",
@@ -79,11 +124,22 @@ class Pipe:
         )
         default_aspect_ratio: str = Field(
             default="1:1",
-            description="Default aspect ratio when auto-detection finds nothing.",
+            description=(
+                "Default aspect ratio for text-to-image when auto-detection finds nothing. "
+                "Use 'auto' to let the provider choose."
+            ),
+        )
+        edit_keep_source_ratio: bool = Field(
+            default=True,
+            description=(
+                "When editing an image and the prompt names no aspect ratio, send 'auto' "
+                "(or nothing) instead of the default ratio so the source image is not "
+                "forced into a different shape."
+            ),
         )
         default_resolution: str = Field(
             default="1K",
-            description="Default image resolution: 512, 1K, 2K, or 4K.",
+            description="Default image resolution: 512, 768, 1K, 1.5K, 2K, or 4K.",
         )
         size: Optional[str] = Field(
             default=None,
@@ -95,7 +151,7 @@ class Pipe:
         )
         output_format: Optional[str] = Field(
             default=None,
-            description="Output image format: png, jpeg, webp, or svg.",
+            description="Output image format: png, jpeg, webp, svg, or gif (model dependent).",
         )
         output_compression: Optional[int] = Field(
             default=None,
@@ -143,11 +199,21 @@ class Pipe:
         )
         enable_streaming: bool = Field(
             default=False,
-            description="Stream partial images via SSE when the model supports it.",
+            description=(
+                "Request SSE streaming when the model supports it (currently OpenAI "
+                "models only). Only the final image is shown; other models ignore this."
+            ),
+        )
+        enable_debug: bool = Field(
+            default=False,
+            description="Print verbose debug logs.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
+        self._capabilities: Dict[str, Dict[str, Any]] = {}
+        self._capabilities_next_fetch: float = 0.0
+        self._capabilities_base: str = ""
         self.tooltips = [
             "Try a different aspect ratio — e.g. '16:9' for widescreen or '9:16' for vertical.",
             "Add artistic direction: 'in the style of Studio Ghibli' or 'cinematic lighting'.",
@@ -271,7 +337,9 @@ class Pipe:
         "20:9",
         "9:21",
         "21:9",
+        "2.35:1",
         "16:9",
+        "9:16",
         "5:4",
         "4:3",
         "3:2",
@@ -279,84 +347,261 @@ class Pipe:
         "2:3",
         "3:4",
         "4:5",
-        "9:16",
+        "5:7",
+        "7:5",
+        "5:2",
         "1:2",
         "2:1",
+        "1:3",
+        "3:1",
         "1:4",
         "4:1",
         "1:8",
         "8:1",
     ]
 
+    # "3/4" is usually a fraction ("three-quarter view"), so only the common
+    # video/screen ratios are accepted in slash form.
+    SLASH_RATIOS = ["16/9", "9/16", "21/9", "9/21"]
+
+    # Deliberately excludes ambiguous words such as "landscape", "portrait",
+    # "cinematic", "wide", "tall", "story" or "phone" that commonly appear in
+    # prompts without implying a canvas shape.
     RATIO_ALIASES = {
         "widescreen": "16:9",
-        "landscape": "16:9",
-        "horizontal": "16:9",
-        "wide": "16:9",
-        "banner": "16:9",
-        "header": "16:9",
-        "desktop": "16:9",
-        "monitor": "16:9",
-        "youtube": "16:9",
-        "cinematic": "21:9",
         "ultrawide": "21:9",
-        "square": "1:1",
+        "ultra-wide": "21:9",
+        "youtube thumbnail": "16:9",
+        "desktop wallpaper": "16:9",
+        "banner": "16:9",
+        "landscape orientation": "16:9",
+        "landscape format": "16:9",
+        "square image": "1:1",
+        "square format": "1:1",
+        "square crop": "1:1",
+        "square canvas": "1:1",
         "instagram post": "1:1",
         "profile picture": "1:1",
         "avatar": "1:1",
-        "portrait": "3:4",
+        "portrait orientation": "3:4",
+        "portrait format": "3:4",
         "vertical": "9:16",
-        "tall": "9:16",
-        "mobile": "9:16",
-        "phone": "9:16",
+        "phone wallpaper": "9:16",
+        "mobile wallpaper": "9:16",
         "instagram story": "9:16",
-        "story": "9:16",
         "tiktok": "9:16",
         "reels": "9:16",
-        "shorts": "9:16",
+        "youtube shorts": "9:16",
     }
 
-    RESOLUTIONS = ["512", "1K", "2K", "4K"]
+    RESOLUTIONS = ["512", "768", "1K", "1.5K", "2K", "4K"]
+    TIER_VALUE = {
+        "512": 0.5,
+        "768": 0.75,
+        "1K": 1.0,
+        "1.5K": 1.5,
+        "2K": 2.0,
+        "4K": 4.0,
+    }
 
     def _detect_aspect_ratio(self, prompt: str) -> Optional[str]:
         p = prompt.lower()
-        for ratio in sorted(self.ASPECT_RATIOS, key=len, reverse=True):
-            variants = [ratio, ratio.replace(":", "/")]
-            if any(v in p for v in variants):
-                return ratio
+        best: Optional[Tuple[int, str]] = None
+
+        def consider(pos: int, ratio: str) -> None:
+            nonlocal best
+            if best is None or pos < best[0]:
+                best = (pos, ratio)
+
+        for ratio in self.ASPECT_RATIOS:
+            m = re.search(rf"(?<![\d:.]){re.escape(ratio)}(?![\d:]|\.\d)", p)
+            if m:
+                consider(m.start(), ratio)
+        for slash in self.SLASH_RATIOS:
+            m = re.search(rf"(?<![\d:/.]){re.escape(slash)}(?![\d:/]|\.\d)", p)
+            if m:
+                consider(m.start(), slash.replace("/", ":"))
+        if best:
+            return best[1]
+
         for alias in sorted(self.RATIO_ALIASES, key=len, reverse=True):
-            if alias in p:
+            if re.search(rf"\b{re.escape(alias)}\b", p):
                 return self.RATIO_ALIASES[alias]
         return None
 
     def _detect_resolution(self, prompt: str) -> Optional[str]:
         p = prompt.lower()
-        for res in sorted(
-            self.RESOLUTIONS,
-            key=lambda s: float(s[:-1]) if s.endswith("K") else int(s),
-            reverse=True,
-        ):
-            tokens = [res.lower()]
+        for res in sorted(self.RESOLUTIONS, key=self.TIER_VALUE.get, reverse=True):
             if res.endswith("K"):
-                tokens.append(f"{res[:-1]} k")
-            for token in tokens:
-                if re.search(rf"\b{re.escape(token)}\b", p):
-                    return res
+                num = re.escape(res[:-1].lower())
+                pattern = rf"(?<![\w.]){num}\s?k(?!\w)"
+            else:
+                pattern = rf"(?<![\w.]){res}\s?px\b"
+            if re.search(pattern, p):
+                return res
         return None
 
-    def _resolve_size_and_ratio(self, prompt: str) -> tuple:
-        if not self.valves.enable_size_detection:
-            return (
-                self.valves.default_aspect_ratio,
-                self.valves.default_resolution,
-                self.valves.size,
+    def _resolve_size_and_ratio(
+        self, prompt: str, is_editing: bool = False
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        detected_ratio = detected_res = None
+        if self.valves.enable_size_detection:
+            detected_ratio = self._detect_aspect_ratio(prompt)
+            detected_res = self._detect_resolution(prompt)
+
+        keep_source = is_editing and self.valves.edit_keep_source_ratio
+        if detected_ratio:
+            aspect_ratio: Optional[str] = detected_ratio
+        elif keep_source:
+            aspect_ratio = "auto"
+        else:
+            aspect_ratio = self.valves.default_aspect_ratio
+
+        if detected_res:
+            resolution: Optional[str] = detected_res
+        elif keep_source:
+            resolution = None
+        else:
+            resolution = self.valves.default_resolution
+
+        return aspect_ratio, resolution, self.valves.size
+
+    # ------------------------------------------------------------------
+    # Model capabilities (/api/v1/images/models)
+    # ------------------------------------------------------------------
+
+    def _debug(self, message: str) -> None:
+        if self.valves.enable_debug:
+            print(f"DEBUG {message}")
+
+    async def _get_capabilities(self) -> Dict[str, Dict[str, Any]]:
+        """Return {model_id: model entry}; empty if unavailable. Cached with a TTL."""
+        base = self.valves.base_url.rstrip("/")
+        if self._capabilities_base != base:
+            self._capabilities = {}
+            self._capabilities_next_fetch = 0.0
+            self._capabilities_base = base
+
+        now = time.time()
+        if now < self._capabilities_next_fetch:
+            return self._capabilities
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{base}/images/models", headers=self._headers())
+            resp.raise_for_status()
+            entries = resp.json().get("data", [])
+            self._capabilities = {
+                m["id"]: m for m in entries if isinstance(m, dict) and m.get("id")
+            }
+            self._capabilities_next_fetch = now + max(
+                self.valves.capabilities_cache_ttl, 60
             )
-        aspect_ratio = (
-            self._detect_aspect_ratio(prompt) or self.valves.default_aspect_ratio
-        )
-        resolution = self._detect_resolution(prompt) or self.valves.default_resolution
-        size = self.valves.size
-        return aspect_ratio, resolution, size
+            self._debug(f"[Capabilities] loaded {len(self._capabilities)} image models")
+        except Exception as e:
+            self._capabilities_next_fetch = now + 60
+            self._debug(f"[Capabilities] fetch failed ({type(e).__name__}): {e}")
+        return self._capabilities
+
+    async def _get_model_entry(self, model_id: str) -> Tuple[Optional[Dict], bool]:
+        """Return (entry or None, capabilities_loaded)."""
+        if not self.valves.enable_capability_filtering:
+            return None, False
+        caps = await self._get_capabilities()
+        return caps.get(model_id), bool(caps)
+
+    @staticmethod
+    def _ratio_value(ratio: str) -> Optional[float]:
+        try:
+            a, b = ratio.split(":")
+            a, b = float(a), float(b)
+            return a / b if a > 0 and b > 0 else None
+        except (ValueError, AttributeError):
+            return None
+
+    def _nearest_ratio(self, ratio: str, supported: List[str]) -> Optional[str]:
+        target = self._ratio_value(ratio)
+        if target is None:
+            return None
+        best, best_dist = None, None
+        for cand in supported:
+            val = self._ratio_value(cand)
+            if val is None:
+                continue
+            dist = abs(math.log(val) - math.log(target))
+            if best_dist is None or dist < best_dist:
+                best, best_dist = cand, dist
+        return best
+
+    def _shape_ratio(
+        self, ratio: Optional[str], sp: Optional[Dict], notes: List[str]
+    ) -> Optional[str]:
+        if not ratio:
+            return None
+        if sp is None:
+            return ratio
+        desc = sp.get("aspect_ratio")
+        if not desc:
+            return None
+        values = desc.get("values") if desc.get("type") == "enum" else None
+        if not values or ratio in values:
+            return ratio
+        if ratio == "auto":
+            return None
+        nearest = self._nearest_ratio(ratio, values)
+        if nearest and nearest != ratio:
+            notes.append(f"aspect ratio {ratio} → {nearest}")
+        return nearest
+
+    def _shape_resolution(
+        self, resolution: Optional[str], sp: Optional[Dict], notes: List[str]
+    ) -> Optional[str]:
+        if not resolution:
+            return None
+        if sp is None:
+            return resolution
+        desc = sp.get("resolution")
+        if not desc:
+            return None
+        values = desc.get("values") if desc.get("type") == "enum" else None
+        if not values or resolution in values:
+            return resolution
+        target = self.TIER_VALUE.get(resolution)
+        cands = [(v, self.TIER_VALUE[v]) for v in values if v in self.TIER_VALUE]
+        if target is None or not cands:
+            return None
+        nearest = min(cands, key=lambda c: abs(math.log(c[1]) - math.log(target)))[0]
+        notes.append(f"resolution {resolution} → {nearest}")
+        return nearest
+
+    @staticmethod
+    def _apply_param(
+        payload: Dict[str, Any],
+        key: str,
+        value: Any,
+        sp: Optional[Dict],
+        notes: List[str],
+    ) -> None:
+        """Set payload[key] if the model supports it, adapting to its descriptor."""
+        if value is None or value == "":
+            return
+        if sp is None:
+            payload[key] = value
+            return
+        desc = sp.get(key)
+        if not desc:
+            notes.append(f"{key} not supported by this model (ignored)")
+            return
+        kind = desc.get("type")
+        if kind == "enum" and value not in desc.get("values", [value]):
+            notes.append(f"{key}={value} not supported by this model (ignored)")
+            return
+        if kind == "range" and isinstance(value, (int, float)):
+            clamped = max(desc.get("min", value), min(desc.get("max", value), value))
+            if clamped != value:
+                notes.append(f"{key} {value} → {clamped}")
+            value = clamped
+        payload[key] = value
 
     # ------------------------------------------------------------------
     # OpenRouter API helpers
@@ -365,334 +610,312 @@ class Pipe:
     def _headers(self) -> Dict[str, str]:
         return {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.valves.api_key}",
+            "Authorization": f"Bearer {self.valves.api_key.strip()}",
             "HTTP-Referer": "https://openwebui.com",
-            "X-Title": "Open WebUI Image Pipe",
+            "X-OpenRouter-Title": "Open WebUI Image Pipe",
         }
+
+    @staticmethod
+    def _split_csv(value: Optional[str]) -> List[str]:
+        return [s.strip() for s in (value or "").split(",") if s.strip()]
 
     def _build_provider_object(self) -> Optional[Dict[str, Any]]:
-        provider = {}
-        if self.valves.provider_only:
-            provider["only"] = [
-                s.strip() for s in self.valves.provider_only.split(",") if s.strip()
-            ]
-        if self.valves.provider_ignore:
-            provider["ignore"] = [
-                s.strip() for s in self.valves.provider_ignore.split(",") if s.strip()
-            ]
-        if self.valves.provider_order:
-            provider["order"] = [
-                s.strip() for s in self.valves.provider_order.split(",") if s.strip()
-            ]
+        provider: Dict[str, Any] = {}
+        for key, raw in (
+            ("only", self.valves.provider_only),
+            ("ignore", self.valves.provider_ignore),
+            ("order", self.valves.provider_order),
+        ):
+            items = self._split_csv(raw)
+            if items:
+                provider[key] = items
         if self.valves.provider_sort:
             provider["sort"] = self.valves.provider_sort.strip()
-        provider["allow_fallbacks"] = self.valves.allow_fallbacks
-        return provider if provider else None
+        if not self.valves.allow_fallbacks:
+            provider["allow_fallbacks"] = False
+        return provider or None
 
-    def _build_image_payload(
-        self,
-        model_id: str,
-        prompt: str,
-        input_images: List[str],
-        aspect_ratio: str,
-        resolution: str,
-        size: Optional[str],
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "model": model_id,
-            "prompt": prompt,
-        }
-        if self.valves.n and self.valves.n > 1:
-            payload["n"] = self.valves.n
+    def _build_image_payload(self, req: "ImageRequest") -> Dict[str, Any]:
+        entry = req.entry
+        sp: Optional[Dict] = entry.get("supported_parameters", {}) if entry else None
+        notes = req.notes
+        payload: Dict[str, Any] = {"model": req.model_id, "prompt": req.prompt}
+
+        # n
+        n = max(1, min(10, self.valves.n or 1))
+        if n > 1 and sp is not None:
+            n_desc = sp.get("n") or {}
+            n_max = n_desc.get("max", 1) if n_desc else 1
+            if n > n_max:
+                notes.append(f"n {n} → {n_max}")
+                n = n_max
+        if n > 1:
+            payload["n"] = n
+
+        # size / aspect ratio / resolution
+        aspect_ratio, resolution, size = req.aspect_ratio, req.resolution, req.size
         if size:
-            payload["size"] = size
+            size = size.strip()
+            if re.fullmatch(r"(?i)512|768|\d(?:\.5)?k", size):
+                resolution = size.upper()
+                size = None
+            elif sp is None or "size" in sp:
+                payload["size"] = size
+            else:
+                m = re.fullmatch(r"(\d+)\s*[xX×]\s*(\d+)", size)
+                if m:
+                    w, h = int(m.group(1)), int(m.group(2))
+                    g = math.gcd(w, h) or 1
+                    aspect_ratio = f"{w // g}:{h // g}"
+                notes.append(f"size {size} not supported by this model (ignored)")
+        if "size" not in payload:
+            req.sent_ratio = self._shape_ratio(aspect_ratio, sp, notes)
+            if req.sent_ratio:
+                payload["aspect_ratio"] = req.sent_ratio
+            req.sent_resolution = self._shape_resolution(resolution, sp, notes)
+            if req.sent_resolution:
+                payload["resolution"] = req.sent_resolution
         else:
-            payload["aspect_ratio"] = aspect_ratio
-            payload["resolution"] = resolution
-        if self.valves.quality:
-            payload["quality"] = self.valves.quality
-        if self.valves.output_format:
-            payload["output_format"] = self.valves.output_format
-        if self.valves.output_compression is not None:
-            payload["output_compression"] = self.valves.output_compression
-        if self.valves.background:
-            payload["background"] = self.valves.background
-        if self.valves.seed is not None:
-            payload["seed"] = self.valves.seed
+            req.sent_ratio = req.sent_resolution = payload["size"]
+
+        # generic optional parameters
+        output_format = (self.valves.output_format or "").strip().lower() or None
+        self._apply_param(payload, "quality", self.valves.quality, sp, notes)
+        self._apply_param(payload, "output_format", output_format, sp, notes)
+        if output_format in ("jpeg", "webp"):
+            self._apply_param(
+                payload, "output_compression", self.valves.output_compression, sp, notes
+            )
+        self._apply_param(payload, "background", self.valves.background, sp, notes)
+        self._apply_param(payload, "seed", self.valves.seed, sp, notes)
+
         if self.valves.user:
-            payload["user"] = self.valves.user
-        if self.valves.enable_streaming:
+            payload["user"] = self.valves.user[:256]
+        if req.session_id:
+            payload["session_id"] = req.session_id[:256]
+
+        # streaming only when the model supports it
+        if self.valves.enable_streaming and (
+            entry is None or entry.get("supports_streaming")
+        ):
             payload["stream"] = True
-        if input_images:
+
+        # reference images
+        if req.input_images:
+            refs_desc = sp.get("input_references") if sp is not None else None
+            max_refs = refs_desc.get("max", 16) if refs_desc else 16
+            images = req.input_images[:max_refs]
+            if len(images) < len(req.input_images):
+                notes.append(
+                    f"reference images {len(req.input_images)} → {len(images)} "
+                    f"(model limit)"
+                )
             payload["input_references"] = [
-                {"type": "image_url", "image_url": {"url": url}}
-                for url in input_images[:16]
+                {"type": "image_url", "image_url": {"url": url}} for url in images
             ]
+
         provider = self._build_provider_object()
         if provider:
             payload["provider"] = provider
         return payload
 
-    async def _generate_image_with_image_api(
-        self,
-        model_id: str,
-        prompt: str,
-        input_images: List[str],
-        aspect_ratio: str,
-        resolution: str,
-        size: Optional[str],
-    ) -> List[str]:
-        url = f"{self.valves.base_url}/images"
-        payload = self._build_image_payload(
-            model_id, prompt, input_images, aspect_ratio, resolution, size
+    @staticmethod
+    def _error_message(body: str) -> str:
+        try:
+            data = json.loads(body)
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict) and err.get("message"):
+                return str(err["message"])
+            if isinstance(err, str):
+                return err
+        except (ValueError, AttributeError):
+            pass
+        return body.strip()[:500] or "(empty response)"
+
+    async def _generate_image_with_image_api(self, req: "ImageRequest") -> List[str]:
+        url = f"{self.valves.base_url.rstrip('/')}/images"
+        payload = self._build_image_payload(req)
+        self._debug(
+            f"[Image API] POST {url} model={req.model_id} "
+            f"ratio={payload.get('aspect_ratio')} resolution={payload.get('resolution')} "
+            f"size={payload.get('size')} refs={len(payload.get('input_references', []))} "
+            f"n={payload.get('n', 1)} stream={payload.get('stream', False)} "
+            f"notes={req.notes}"
         )
-        print(
-            f"DEBUG [Image API] POST {url}  model={model_id}  "
-            f"ratio={aspect_ratio}  resolution={resolution}  size={size}  "
-            f"input_images={len(input_images)}  n={self.valves.n}  "
-            f"stream={payload.get('stream', False)}"
-        )
-        if payload.get("stream"):
-            image_urls = await self._stream_image_api(url, payload)
-            if image_urls:
-                return image_urls
-            print("DEBUG [Image API] Stream returned no image; falling back to buffered.")
+
         async with httpx.AsyncClient(timeout=self.valves.timeout) as client:
-            resp = await client.post(url, headers=self._headers(), json=payload)
-        if resp.status_code != 200:
-            raise Exception(f"OpenRouter HTTP {resp.status_code}: {resp.text}")
-        data = resp.json()
-        print(f"DEBUG [Image API] Response keys: {list(data.keys())}")
-        image_urls = self._extract_images_from_response(data)
+            async with client.stream(
+                "POST", url, headers=self._headers(), json=payload
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode(errors="replace")
+                    raise OpenRouterHTTPError(
+                        resp.status_code, self._error_message(body)
+                    )
+                content_type = resp.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    image_urls = await self._parse_sse(resp)
+                else:
+                    raw = await resp.aread()
+                    try:
+                        data = json.loads(raw)
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Invalid JSON from Image API: {raw[:200]!r}"
+                        ) from e
+                    self._debug(f"[Image API] response keys: {list(data.keys())}")
+                    image_urls = self._extract_images_from_response(data)
+
         if not image_urls:
-            print(f"DEBUG [Image API] Full response: {data}")
             raise ValueError(
                 "No images found in response. Check that the model supports /api/v1/images."
             )
         return image_urls
 
     @classmethod
-    def _extract_images_from_response(
-        cls, data: Dict[str, Any]
-    ) -> List[str]:
-        """Extract data-URLs from a buffered Image API response."""
+    def _extract_images_from_response(cls, data: Dict[str, Any]) -> List[str]:
+        """Extract data-URLs / URLs from a buffered Image API response."""
         image_urls = []
-        for entry in data.get("data", []):
+        for entry in data.get("data", []) or []:
             b64 = entry.get("b64_json") or entry.get("b64Json") or ""
-            media_type = entry.get("media_type", "image/png")
+            media_type = entry.get("media_type") or "image/png"
             if b64:
                 image_urls.append(f"data:{media_type};base64,{b64}")
             elif entry.get("url"):
                 image_urls.append(entry["url"])
         return list(dict.fromkeys(image_urls))
 
-    async def _stream_image_api(
-        self, url: str, payload: Dict[str, Any]
-    ) -> List[str]:
-        """Parse the SSE stream emitted by /images when stream=true."""
-        image_urls = []
-        print("DEBUG [Image API] Streaming mode enabled")
-        try:
-            async with httpx.AsyncClient(timeout=self.valves.timeout) as client:
-                async with client.stream(
-                    "POST", url, headers=self._headers(), json=payload
-                ) as resp:
-                    if resp.status_code != 200:
-                        text = await resp.aread()
-                        raise Exception(
-                            f"OpenRouter HTTP {resp.status_code}: {text.decode(errors='replace')}"
-                        )
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        chunk = line[len("data:"):].strip()
-                        if not chunk or chunk == "[DONE]":
-                            continue
-                        try:
-                            event = json.loads(chunk)
-                        except json.JSONDecodeError:
-                            continue
-                        event_type = event.get("type", "")
-                        if event_type == "image_generation.completed":
-                            b64 = event.get("b64_json") or event.get("b64Json") or ""
-                            media_type = event.get("media_type", "image/png")
-                            if b64:
-                                image_urls.append(
-                                    f"data:{media_type};base64,{b64}"
-                                )
-                        elif event_type == "error":
-                            msg = (
-                                event.get("error", {}).get("message", "")
-                                if isinstance(event.get("error"), dict)
-                                else str(event.get("error", ""))
-                            )
-                            raise Exception(f"Stream error: {msg}")
-        except Exception as e:
-            print(f"DEBUG [Image API] Stream failed: {e}")
-            raise
+    @staticmethod
+    async def _parse_sse(resp: httpx.Response) -> List[str]:
+        """Collect final images from the SSE stream (partial images are ignored)."""
+        image_urls: List[str] = []
+        async for line in resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            chunk = line[len("data:") :].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                event = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            event_type = event.get("type", "")
+            if event_type == "image_generation.completed":
+                b64 = event.get("b64_json") or event.get("b64Json") or ""
+                if b64:
+                    media_type = event.get("media_type") or "image/png"
+                    image_urls.append(f"data:{media_type};base64,{b64}")
+            elif event_type == "error":
+                err = event.get("error")
+                msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                raise Exception(f"Stream error: {msg}")
         return image_urls
 
-    def _build_legacy_payload(
-        self,
-        model_id: str,
-        prompt: str,
-        input_images: List[str],
-        aspect_ratio: str,
-        resolution: str,
-        size: Optional[str],
-    ) -> Dict[str, Any]:
-        if input_images:
-            content = [{"type": "text", "text": prompt}]
-            for img_data_url in input_images:
+    def _build_legacy_payload(self, req: "ImageRequest") -> Dict[str, Any]:
+        if req.input_images:
+            content: Any = [{"type": "text", "text": req.prompt}]
+            for img_data_url in req.input_images:
                 content.append(
                     {"type": "image_url", "image_url": {"url": img_data_url}}
                 )
         else:
-            content = prompt
-        messages = [{"role": "user", "content": content}]
-        modalities = [
-            m.strip() for m in self.valves.legacy_modalities.split(",") if m.strip()
-        ]
-        image_config = {"aspect_ratio": aspect_ratio}
-        if size:
-            image_config["size"] = size
-        else:
-            image_config["image_size"] = resolution
+            content = req.prompt
+        modalities = self._split_csv(self.valves.legacy_modalities)
+
+        image_config: Dict[str, Any] = {}
+        if req.aspect_ratio and req.aspect_ratio != "auto":
+            image_config["aspect_ratio"] = req.aspect_ratio
+        if req.size:
+            image_config["size"] = req.size
+        elif req.resolution:
+            image_config["image_size"] = req.resolution
         if self.valves.quality:
             image_config["quality"] = self.valves.quality
-        payload = {
-            "model": model_id,
-            "messages": messages,
+        req.sent_ratio = image_config.get("aspect_ratio")
+        req.sent_resolution = image_config.get("image_size") or image_config.get("size")
+
+        payload: Dict[str, Any] = {
+            "model": req.model_id,
+            "messages": [{"role": "user", "content": content}],
             "modalities": modalities,
-            "image_config": image_config,
             "stream": False,
         }
+        if image_config:
+            payload["image_config"] = image_config
         provider = self._build_provider_object()
         if provider:
             payload["provider"] = provider
         return payload
 
-    async def _generate_image_with_legacy_api(
-        self,
-        model_id: str,
-        prompt: str,
-        input_images: List[str],
-        aspect_ratio: str,
-        resolution: str,
-        size: Optional[str],
-    ) -> List[str]:
-        url = f"{self.valves.base_url}/chat/completions"
-        payload = self._build_legacy_payload(
-            model_id, prompt, input_images, aspect_ratio, resolution, size
-        )
-        print(
-            f"DEBUG [Legacy API] POST {url}  model={model_id}  "
-            f"ratio={aspect_ratio}  resolution={resolution}  size={size}  "
-            f"input_images={len(input_images)}"
+    async def _generate_image_with_legacy_api(self, req: "ImageRequest") -> List[str]:
+        url = f"{self.valves.base_url.rstrip('/')}/chat/completions"
+        payload = self._build_legacy_payload(req)
+        self._debug(
+            f"[Legacy API] POST {url} model={req.model_id} "
+            f"image_config={payload.get('image_config')} refs={len(req.input_images)}"
         )
         async with httpx.AsyncClient(timeout=self.valves.timeout) as client:
             resp = await client.post(url, headers=self._headers(), json=payload)
         if resp.status_code != 200:
-            raise Exception(f"OpenRouter HTTP {resp.status_code}: {resp.text}")
+            raise OpenRouterHTTPError(resp.status_code, self._error_message(resp.text))
         data = resp.json()
-        print(f"DEBUG [Legacy API] Response keys: {list(data.keys())}")
-        image_urls = []
-        try:
-            choices = data.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                for img in message.get("images", []):
-                    url_val = img.get("image_url", {}).get("url", "")
-                    if url_val:
-                        image_urls.append(url_val)
-                if not image_urls:
-                    msg_content = message.get("content", "")
-                    if isinstance(msg_content, list):
-                        for item in msg_content:
-                            if item.get("type") == "image_url":
-                                url_val = item.get("image_url", {}).get("url", "")
-                                if url_val:
-                                    image_urls.append(url_val)
-        except Exception as e:
-            print(f"DEBUG [Legacy API] Parse error: {e}")
-            print(f"DEBUG [Legacy API] Full response: {data}")
-            raise ValueError(f"Cannot parse image from response: {data}") from e
+        self._debug(f"[Legacy API] response keys: {list(data.keys())}")
+
+        image_urls: List[str] = []
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message", {}) or {}
+            for img in message.get("images", []) or []:
+                url_val = (img.get("image_url") or {}).get("url", "")
+                if url_val:
+                    image_urls.append(url_val)
+            if not image_urls and isinstance(message.get("content"), list):
+                for item in message["content"]:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        url_val = (item.get("image_url") or {}).get("url", "")
+                        if url_val:
+                            image_urls.append(url_val)
         if not image_urls:
-            print(f"DEBUG [Legacy API] Full response: {data}")
+            self._debug(f"[Legacy API] response without images: {str(data)[:500]}")
             raise ValueError(
                 "No images found in legacy response. Check legacy_modalities and model support."
             )
-        return image_urls
+        return list(dict.fromkeys(image_urls))
 
-    async def _generate_image(
-        self,
-        model_id: str,
-        prompt: str,
-        input_images: List[str],
-        aspect_ratio: str,
-        resolution: str,
-        size: Optional[str],
-    ) -> List[str]:
-        errors = []
+    # HTTP statuses that mean "this request shape/model is not handled by the
+    # Image API". Everything else (401/402/403/429/5xx/timeouts) is never retried
+    # on another endpoint, to avoid paying twice or hiding real problems.
+    LEGACY_FALLBACK_STATUSES = (400, 404, 405, 422)
+
+    async def _generate_image(self, req: "ImageRequest") -> List[str]:
+        if req.skip_image_api and self.valves.enable_legacy_chat_fallback:
+            self._debug(f"{req.model_id} is not an Image API model; using legacy path")
+            return await self._generate_image_with_legacy_api(req)
+
         try:
-            return await self._generate_image_with_image_api(
-                model_id, prompt, input_images, aspect_ratio, resolution, size
-            )
-        except Exception as e:
-            errors.append(f"Image API error: {e}")
-            if not self.valves.enable_legacy_chat_fallback:
+            return await self._generate_image_with_image_api(req)
+        except OpenRouterHTTPError as e:
+            if (
+                not self.valves.enable_legacy_chat_fallback
+                or e.status_code not in self.LEGACY_FALLBACK_STATUSES
+            ):
                 raise
+            image_api_error = str(e)
+
         try:
-            return await self._generate_image_with_legacy_api(
-                model_id, prompt, input_images, aspect_ratio, resolution, size
-            )
+            return await self._generate_image_with_legacy_api(req)
         except Exception as e:
-            errors.append(f"Legacy API error: {e}")
             raise Exception(
                 "Failed to generate image with both Image API and legacy API.\n"
-                + "\n".join(errors)
+                f"Image API error: {image_api_error}\n"
+                f"Legacy API error: {e}"
             )
-
-    # ------------------------------------------------------------------
-    # SSE helpers
-    # ------------------------------------------------------------------
-
-    def _chunk(self, model_id: str, content: str) -> str:
-        payload = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": content},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        return f"data: {json.dumps(payload)}\n\n"
-
-    def _stop_chunk(self, model_id: str) -> str:
-        payload = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        return f"data: {json.dumps(payload)}\n\n"
 
     # ------------------------------------------------------------------
     # Capability hints
     # ------------------------------------------------------------------
 
+    # Only used when /images/models is unavailable or the model is not listed.
     IMAGE_INPUT_SUPPORTED = [
         "gemini",
         "gpt-image",
@@ -700,7 +923,6 @@ class Pipe:
         "recraft",
         "riverflow",
         "qwen-image",
-        "muse",
         "flux",
         "krea",
         "grok-imagine",
@@ -715,6 +937,7 @@ class Pipe:
         "sdxl",
         "playground",
         "aura",
+        "muse-image",
     ]
 
     def _model_supports_image_input(self, model_id: str):
@@ -725,9 +948,66 @@ class Pipe:
             return True
         return None
 
+    @staticmethod
+    def _entry_refs(entry: Dict[str, Any]) -> Dict[str, Any]:
+        return (entry.get("supported_parameters") or {}).get("input_references") or {}
+
+    def _supports_image_input(
+        self, model_id: str, entry: Optional[Dict[str, Any]]
+    ) -> Optional[bool]:
+        if entry is not None:
+            return self._entry_refs(entry).get("max", 0) > 0
+        return self._model_supports_image_input(model_id)
+
+    def _image_edit_alternatives(self, caps: Dict[str, Dict[str, Any]]) -> List[str]:
+        configured = self._parse_models()
+        if caps:
+            alts = [
+                m for m in configured
+                if m in caps and self._entry_refs(caps[m]).get("max", 0) > 0
+            ]
+            if alts:
+                return alts
+        return [m for m in configured if self._model_supports_image_input(m)]
+
+    # ------------------------------------------------------------------
+    # Error presentation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _describe_error(err: Exception) -> str:
+        if isinstance(err, OpenRouterHTTPError):
+            hints = {
+                401: "Check the API key in **Valves → api_key**.",
+                402: "The Image API requires a balance above $1 before each request, "
+                "regardless of the image price. Top up at https://openrouter.ai/credits.",
+                429: "Rate limited. Wait a moment and try again.",
+            }
+            hint = hints.get(err.status_code)
+            return f"{err}\n\n💡 {hint}" if hint else f"{err}"
+        if isinstance(err, httpx.TimeoutException):
+            return (
+                f"Request timed out ({err.__class__.__name__}). "
+                "Increase **Valves → timeout** for large/high-resolution images."
+            )
+        if isinstance(err, httpx.RequestError):
+            return f"Network error talking to OpenRouter ({err.__class__.__name__}): {err}"
+        return str(err) or err.__class__.__name__
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_prompt(message: Dict[str, Any]) -> str:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return (content or "").strip() if isinstance(content, str) else ""
 
     async def pipe(
         self,
@@ -735,87 +1015,90 @@ class Pipe:
         __request__: Request,
         __user__: dict,
         __event_emitter__=None,
+        __task__=None,
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
+        metadata = __metadata__ or {}
 
-        raw_model = body.get("model", "")
-        model_id = self._clean_model_id(raw_model)
+        # Open WebUI background tasks (title, tags, follow-ups, ...) call the
+        # selected model too. Never spend money generating images for them; an
+        # empty reply makes Open WebUI fall back to its defaults.
+        if __task__ or metadata.get("task"):
+            return
+
+        model_id = self._clean_model_id(body.get("model", ""))
 
         if not self.valves.api_key:
-            yield self._chunk(
-                model_id,
+            yield (
                 "❌ **Error:** OpenRouter API key is missing. "
-                "Please set it in **Valves → api_key**.",
+                "Please set it in **Valves → api_key**."
             )
-            yield self._stop_chunk(model_id)
             return
 
         if not model_id:
-            yield self._chunk(
-                model_id, "❌ **Error:** Could not determine model ID from request."
-            )
-            yield self._stop_chunk(model_id)
+            yield "❌ **Error:** Could not determine model ID from request."
             return
 
         try:
-            last_msg = body["messages"][-1]
-            content = last_msg.get("content", "")
-            if isinstance(content, list):
-                prompt = "".join(
-                    item["text"] for item in content if item.get("type") == "text"
-                )
-            else:
-                prompt = content
-            prompt = prompt.strip()
-
+            messages = body.get("messages") or []
+            prompt = self._extract_prompt(messages[-1]) if messages else ""
             if not prompt:
-                yield self._chunk(
-                    model_id, "❌ **Error:** No text prompt found in the last message."
-                )
-                yield self._stop_chunk(model_id)
+                yield "❌ **Error:** No text prompt found in the last message."
                 return
 
-            input_images = self._find_images_in_conversation(body["messages"])
+            input_images = self._find_images_in_conversation(messages)
             is_editing = len(input_images) > 0
 
+            entry, caps_loaded = await self._get_model_entry(model_id)
+            caps = self._capabilities if caps_loaded else {}
+
             if is_editing:
-                support = self._model_supports_image_input(model_id)
+                support = self._supports_image_input(model_id, entry)
                 if support is False:
-                    yield self._chunk(
-                        model_id,
+                    alts = self._image_edit_alternatives(caps)
+                    alt_text = "\n".join(f"- `{m}`" for m in alts)
+                    yield (
                         f"⚠️ **Model `{model_id}` does not support image input.**\n\n"
-                        f"Image-to-image editing requires a model that accepts image uploads. "
-                        f"Please switch to one of these:\n\n"
-                        f"- `google/gemini-3.1-flash-image`\n"
-                        f"- `google/gemini-2.5-flash-image`\n"
-                        f"- `openai/gpt-image-2`\n"
-                        f"- `bytedance-seed/seedream-5-0-pro`\n"
-                        f"- `qwen/qwen-image-3`\n\n"
-                        f"Or remove the uploaded image to use text-to-image generation.",
+                        "Image-to-image editing requires a model that accepts image uploads."
+                        + (f" Please switch to one of these:\n\n{alt_text}\n\n" if alts else " ")
+                        + "Or remove the uploaded image to use text-to-image generation."
                     )
-                    yield self._stop_chunk(model_id)
                     return
-                elif support is None:
-                    print(
-                        f"WARNING: Model '{model_id}' is not in the known compatibility list. "
-                        f"Proceeding with image input — API may return an error."
+                if support is None:
+                    self._debug(
+                        f"Model '{model_id}' not in compatibility list; "
+                        "proceeding with image input."
                     )
-
-            aspect_ratio, resolution, size = self._resolve_size_and_ratio(prompt)
-
-            if is_editing:
-                status_msg = (
-                    f"✏️ Editing image with `{model_id}` — "
-                    f"ratio: **{aspect_ratio}** | resolution: **{resolution}**…"
+            elif entry is not None and self._entry_refs(entry).get("min", 0) > 0:
+                yield (
+                    f"⚠️ **Model `{model_id}` is an edit-only model** and needs at least "
+                    "one reference image. Upload an image and describe the change."
                 )
-            else:
-                status_msg = (
-                    f"🎨 Generating image with `{model_id}` — "
-                    f"ratio: **{aspect_ratio}** | resolution: **{resolution}**…"
-                )
+                return
 
-            print(
-                f"DEBUG: model={model_id}  prompt={prompt[:80]}  "
-                f"ratio={aspect_ratio}  resolution={resolution}  size={size}  images={len(input_images)}"
+            aspect_ratio, resolution, size = self._resolve_size_and_ratio(
+                prompt, is_editing
+            )
+            req = ImageRequest(
+                model_id=model_id,
+                prompt=prompt,
+                input_images=input_images,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                size=size,
+                entry=entry,
+                skip_image_api=caps_loaded and entry is None,
+                session_id=metadata.get("chat_id"),
+            )
+
+            verb = "✏️ Editing image" if is_editing else "🎨 Generating image"
+            shape = f"ratio: **{aspect_ratio or 'auto'}**"
+            if resolution:
+                shape += f" | resolution: **{resolution}**"
+            status_msg = f"{verb} with `{model_id}` — {shape}…"
+            self._debug(
+                f"model={model_id} prompt={prompt[:80]!r} ratio={aspect_ratio} "
+                f"resolution={resolution} size={size} images={len(input_images)}"
             )
 
             if __event_emitter__:
@@ -826,24 +1109,22 @@ class Pipe:
                     }
                 )
 
-            image_urls = await self._generate_image(
-                model_id, prompt, input_images, aspect_ratio, resolution, size
-            )
+            image_urls = await self._generate_image(req)
 
+            ratio_txt = req.sent_ratio or "auto"
+            res_txt = req.sent_resolution or "model default"
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"✅ Done! ({aspect_ratio} · {resolution})",
+                            "description": f"✅ Done! ({ratio_txt} · {res_txt})",
                             "done": True,
                         },
                     }
                 )
 
             op_text = "edited" if is_editing else "generated"
-            tip = random.choice(self.tooltips)
-
             if len(image_urls) == 1:
                 images_md = f"![Result]({image_urls[0]})"
             else:
@@ -854,14 +1135,16 @@ class Pipe:
             response = (
                 f"**🖼️ Here is your {op_text} image:**\n\n"
                 f"{images_md}\n\n"
-                f"**Ratio:** `{aspect_ratio}` | **Resolution:** `{resolution}` | "
+                f"**Ratio:** `{ratio_txt}` | **Resolution:** `{res_txt}` | "
                 f"**Model:** `{model_id}`\n\n"
-                f"💡 _Tip: {tip}_"
             )
-            yield self._chunk(model_id, response)
+            if req.notes:
+                response += f"⚙️ _Adjusted for this model: {'; '.join(req.notes)}_\n\n"
+            response += f"💡 _Tip: {random.choice(self.tooltips)}_"
+            yield response
 
         except Exception as err:
-            print(f"ERROR: {err}")
+            print(f"ERROR: {type(err).__name__}: {err}")
             if __event_emitter__:
                 await __event_emitter__(
                     {
@@ -869,8 +1152,4 @@ class Pipe:
                         "data": {"description": "❌ Error occurred", "done": True},
                     }
                 )
-            yield self._chunk(model_id, f"❌ **Error:** {str(err)}")
-
-        finally:
-            yield self._stop_chunk(model_id)
-
+            yield f"❌ **Error:** {self._describe_error(err)}"

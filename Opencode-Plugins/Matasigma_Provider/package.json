@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-model-sync",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that registers an OpenAI-compatible provider and auto-syncs its model list",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src"],
+  "keywords": ["opencode", "opencode-plugin", "provider", "models", "openai-compatible"],
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}
