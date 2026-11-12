@@ -1,7 +1,7 @@
 """
 title: LiteLLM Unified Image Generator & Editor (Manifold)
 author: adapted from dfirmans' OpenRouter image pipe
-version: 1.0.0
+version: 1.2.0
 description: >
   Unified Pipe for image generation and editing in Open WebUI via LiteLLM /
   a LiteLLM Proxy gateway (https://docs.litellm.ai).
@@ -21,6 +21,7 @@ requirements: httpx
 import re
 import json
 import base64
+import hashlib
 import time
 import uuid
 import random
@@ -31,6 +32,16 @@ from pydantic import BaseModel, Field
 from fastapi import Request
 
 
+class ImageRouteError(Exception):
+    """Failure of a /v1/images/* call, carrying the HTTP status code when
+    available, so the caller can decide whether a chat-completions fallback
+    is safe (i.e. the first request clearly did not generate anything)."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class Pipe:
     """
     Unified LiteLLM image generation manifold pipe.
@@ -39,6 +50,26 @@ class Pipe:
     the exact `model_name` strings your LiteLLM proxy serves (or qualified
     SDK ids like `gemini/gemini-2.5-flash-image` when the proxy simply
     forwards them). Each entry appears as its own model in Open WebUI.
+
+    v1.2.0:
+    - Answer Open WebUI background task calls (chat title, tags, follow-up
+      suggestions, ...) locally instead of generating an image. By default
+      Open WebUI routes these task calls to the same model that handled the
+      chat, so an image pipe would otherwise fire extra LiteLLM requests
+      (and 429s) on every turn. New valve `handle_task_calls_locally`.
+
+    v1.1.0:
+    - Deduplicate returned images by content, so models/proxies that return
+      the same image more than once (reported with Gemini 3 Pro Image /
+      "nano banana" models, cf. open-webui issue #19518) no longer render
+      duplicates in the chat.
+    - The chat-completions fallback is now only attempted when the
+      images-route request clearly did not generate anything (route missing,
+      connection error, explicit "unsupported" errors). This prevents double
+      generation (and double billing) for expensive models when the first
+      call timed out or returned an unparseable success response.
+    - New valve `history_images_as_input` to disable reusing previous outputs
+      as edit inputs.
     """
 
     class Valves(BaseModel):
@@ -62,6 +93,7 @@ class Pipe:
                 "gpt-image-1, "
                 "gemini/gemini-2.5-flash-image, "
                 "gemini/gemini-3-pro-image-preview, "
+                "vertex_ai/gemini-3-pro-image-preview, "
                 "vertex_ai/imagen-4.0-generate-001, "
                 "black_forest_labs/flux-pro-1.1, "
                 "stability/sd3.5-large"
@@ -127,7 +159,11 @@ class Pipe:
         )
         n: int = Field(
             default=1,
-            description="Number of images to generate (1-10; dall-e-3 supports n=1).",
+            description=(
+                "Number of images to generate (1-10; dall-e-3 supports n=1). "
+                "For Gemini image models n maps to candidateCount — every "
+                "candidate is a separate generation with its own cost."
+            ),
         )
         user: Optional[str] = Field(
             default=None,
@@ -147,6 +183,26 @@ class Pipe:
         max_input_images: int = Field(
             default=16,
             description="Max uploaded images sent to /v1/images/edits per request.",
+        )
+        history_images_as_input: bool = Field(
+            default=True,
+            description=(
+                "Use images from earlier turns (including images this pipe "
+                "generated before) as edit inputs for follow-up prompts. Set "
+                "to False to only use images attached to the newest message, "
+                "so follow-ups do a fresh generation instead of editing the "
+                "previous result."
+            ),
+        )
+        handle_task_calls_locally: bool = Field(
+            default=True,
+            description=(
+                "Open WebUI sends background task calls (chat title, tags, "
+                "follow-up suggestions, ...) to the same model by default. "
+                "When True, this pipe answers them locally with a stub text "
+                "and does NOT call LiteLLM — otherwise every chat turn would "
+                "also trigger image generations for those tasks."
+            ),
         )
         # ---------- advanced ----------
         extra_params_json: str = Field(
@@ -321,10 +377,41 @@ class Pipe:
                                        content, re.IGNORECASE):
                 images.append(http_url)
 
-        return list(dict.fromkeys(images))
+        return self._dedupe_images(images)
+
+    @classmethod
+    def _dedupe_images(cls, image_urls: List[str]) -> List[str]:
+        """Drop duplicate images, including the same image returned twice in
+        different encodings (e.g. two b64_json entries that only differ in
+        their data-URL prefix). Some proxies/models return the identical
+        image more than once (seen with Gemini 3 Pro Image / "nano banana"
+        models), which would otherwise render as duplicated images."""
+        seen = set()
+        deduped = []
+        for url in image_urls:
+            key = url
+            if isinstance(url, str) and url.startswith("data:"):
+                try:
+                    _, payload = cls._decode_data_url(url)
+                    key = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+                except Exception:
+                    pass
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(url)
+        if len(deduped) != len(image_urls):
+            print(
+                f"DEBUG [Dedup] Dropped {len(image_urls) - len(deduped)} "
+                f"duplicate image(s) from {len(image_urls)} returned image(s)."
+            )
+        return deduped
 
     def _find_images_in_conversation(self, messages: List[Dict]) -> List[str]:
-        for message in reversed(messages):
+        candidates = (
+            messages if self.valves.history_images_as_input else messages[-1:]
+        )
+        for message in reversed(candidates):
             imgs = self._extract_images_from_message(message)
             if imgs:
                 return imgs
@@ -726,7 +813,10 @@ class Pipe:
             f"input_images={len(input_images)}  -> HTTP {resp.status_code}"
         )
         if resp.status_code != 200:
-            raise Exception(f"LiteLLM proxy HTTP {resp.status_code}: {resp.text}")
+            raise ImageRouteError(
+                f"LiteLLM proxy HTTP {resp.status_code}: {resp.text}",
+                status_code=resp.status_code,
+            )
         data_json = resp.json()
         print(f"DEBUG [Images] Response keys: {list(data_json.keys())}")
         image_urls = self._extract_images_from_response(data_json)
@@ -752,7 +842,7 @@ class Pipe:
                 image_urls.append(cls._normalize_base64(b64))
             elif entry.get("url"):
                 image_urls.append(entry["url"])
-        return list(dict.fromkeys(image_urls))
+        return cls._dedupe_images(image_urls)
 
     def _build_chat_fallback_payload(
         self,
@@ -840,7 +930,25 @@ class Pipe:
         except Exception as e:
             print(f"DEBUG [Chat fallback] Parse error: {e}")
             raise ValueError(f"Cannot parse image from chat response: {data}") from e
-        return list(dict.fromkeys(image_urls))
+        return cls._dedupe_images(image_urls)
+
+    def _fallback_is_safe(self, exc: Exception) -> bool:
+        """Only fall back to /v1/chat/completions when the images-route call
+        clearly did NOT generate anything. Retrying after a timeout, a 5xx,
+        or an unparseable 200 response can make expensive models (Gemini 3
+        Pro Image / nano banana, gpt-image-1, ...) generate — and bill — the
+        image a second time."""
+        if isinstance(exc, httpx.TimeoutException):
+            return False
+        if isinstance(exc, httpx.HTTPError):
+            return True
+        status = getattr(exc, "status_code", None)
+        if status in (404, 405, 501):
+            return True
+        if isinstance(status, int) and 400 <= status < 500:
+            message = str(exc).lower()
+            return "not supported" in message or "unsupported" in message
+        return False
 
     async def _generate_image(
         self,
@@ -856,9 +964,15 @@ class Pipe:
             )
         except Exception as e:
             errors.append(f"Images route error: {e}")
-            print(f"DEBUG [Images] Falling back: {e}")
             if not self.valves.enable_chat_completions_fallback:
                 raise
+            if not self._fallback_is_safe(e):
+                print(
+                    f"DEBUG [Images] Skipping chat fallback (retrying could "
+                    f"generate the image a second time): {e}"
+                )
+                raise
+            print(f"DEBUG [Images] Images route unavailable, falling back: {e}")
         try:
             return await self._generate_with_chat_fallback(
                 model_id, prompt, input_images
@@ -949,6 +1063,50 @@ class Pipe:
         return None
 
     # ------------------------------------------------------------------
+    # Open WebUI background task calls (title / tags / follow-ups / ...)
+    # ------------------------------------------------------------------
+
+    TASK_MARKERS = (
+        "title",
+        "follow_up",
+        "tags",
+        "emoji",
+        "query",
+        "autocomplete",
+        "image_prompt",
+        "function_calling",
+        "moa",
+    )
+
+    def _detect_background_task(self, body: dict) -> Optional[str]:
+        """Return the Open WebUI task type when this request is a background
+        task call (chat title, tags, follow-up suggestions, ...). Open WebUI
+        marks them with metadata.task and, by default, routes them to the
+        same model that handled the chat — for an image pipe that means
+        extra image generations (and 429s) on every chat turn."""
+        metadata = body.get("metadata") or {}
+        task = str(metadata.get("task") or "").lower()
+        if not task:
+            return None
+        for marker in self.TASK_MARKERS:
+            if marker in task:
+                return task
+        return None
+
+    def _task_stub_chunks(self, task: str, model_id: str) -> List[str]:
+        """Minimal text answer for a task call, shaped so Open WebUI's own
+        fallbacks kick in: title generation falls back to the first user
+        message when the reply is not JSON, and tags/follow-ups disappear
+        when the reply is an empty list. No LiteLLM call is made."""
+        if "title" in task:
+            content = "title"  # no JSON braces -> OWUI falls back to the user's message
+        elif "tags" in task or "follow_up" in task:
+            content = "[]"  # parsed as an empty list -> feature stays quiet
+        else:
+            content = ""
+        return [self._chunk(model_id, content), self._stop_chunk(model_id)]
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -962,6 +1120,17 @@ class Pipe:
 
         raw_model = body.get("model", "")
         model_id = self._clean_model_id(raw_model)
+
+        if self.valves.handle_task_calls_locally:
+            task = self._detect_background_task(body)
+            if task:
+                print(
+                    f"DEBUG: answering Open WebUI task call '{task}' locally "
+                    f"— no image generation."
+                )
+                for chunk in self._task_stub_chunks(task, model_id):
+                    yield chunk
+                return
 
         if not self.valves.api_key:
             yield self._chunk(
