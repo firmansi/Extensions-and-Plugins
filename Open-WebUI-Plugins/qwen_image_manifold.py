@@ -1,7 +1,7 @@
 """
 title: Qwen Image Generation & Editing (Manifold)
 author: dfirmans (upgraded by AI)
-version: 5.0.0
+version: 5.1.0
 description: >
   Manifold Pipe for Alibaba Cloud Model Studio (DashScope) Qwen-Image models.
   Every model listed in the `models` valve is registered as its own selectable
@@ -10,6 +10,11 @@ description: >
   qwen-image-plus and the qwen-image-edit / edit-plus / edit-max series.
   Text-to-image and image-to-image (editing) are routed automatically from the
   attached image, with per-family parameter and size handling.
+  v5.1.0: Open WebUI file references (uploads and previously generated
+  images) are resolved back to bytes, generated results are persisted as
+  Open WebUI files so later turns can edit them, background tasks are
+  ignored, and image preparation runs off the event loop with aggressive
+  downscaling — noticeably faster edits.
   Compatible with Open WebUI 0.11.4+.
 required_open_webui_version: 0.11.4
 requirements: pillow, httpx, anyio
@@ -24,6 +29,7 @@ import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Tuple
+from urllib.parse import urlparse
 
 import anyio
 import httpx
@@ -215,7 +221,10 @@ class Pipe:
             default=True,
             description=(
                 "Enable prompt rewriting. For Qwen-Image 3.0 this also controls "
-                "prompt_extend_mode and enable_thinking."
+                "prompt_extend_mode and enable_thinking. Prompt rewriting runs "
+                "an extra LLM pass before rendering, so it adds several seconds "
+                "of latency — disable for faster responses when your prompts "
+                "are already detailed."
             ),
         )
         prompt_extend_mode: Literal["direct", "agent"] = Field(
@@ -271,6 +280,35 @@ class Pipe:
             ge=1,
             le=3,
             description="Max reference images sent for editing (Qwen supports 1-3).",
+        )
+        input_max_side: int = Field(
+            default=2048,
+            ge=512,
+            le=8192,
+            description=(
+                "Downscale input images so their longest side is at most this "
+                "many pixels before JPEG-encoding them for the API. Smaller "
+                "values are much faster to prepare and upload; 2048 is "
+                "plenty for Qwen editing."
+            ),
+        )
+        persist_generated_images: bool = Field(
+            default=True,
+            description=(
+                "Upload generated images to Open WebUI storage and return them "
+                "as /api/v1/files/<id>/content references instead of inline "
+                "base64 or DashScope's 24h URLs. Keeps results editable in "
+                "later turns (Open WebUI rewrites inline base64 out of chat "
+                "history, and DashScope URLs expire) and keeps chats small."
+            ),
+        )
+        files_api_token: str = Field(
+            default="",
+            description=(
+                "Optional Open WebUI API token used to fetch uploaded images "
+                "when the request carries no Authorization header (e.g. "
+                "direct API calls)."
+            ),
         )
         prefer_async_legacy: bool = Field(
             default=False,
@@ -377,8 +415,22 @@ class Pipe:
 
     _MAX_B64_BYTES = 10 * 1024 * 1024
 
+    def _downscale(self, img: Image.Image) -> Image.Image:
+        """Shrink an input image to `input_max_side` before encoding.
+
+        Encoding a 4K upload at high quality is the slowest part of an edit
+        request; Qwen gains nothing from anything above ~2K.
+        """
+        max_side = max(512, int(self.valves.input_max_side or 2048))
+        w, h = img.size
+        if max(w, h) <= max_side:
+            return img
+        ratio = max_side / max(w, h)
+        return img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
+
     def _image_to_base64(self, img: Image.Image) -> str:
         """Convert a PIL Image to a base64 data URL under Qwen's 10 MB limit."""
+        img = self._downscale(img)
         if img.mode in ("RGBA", "P", "LA"):
             background = Image.new("RGB", img.size, (255, 255, 255))
             if img.mode == "P":
@@ -392,7 +444,9 @@ class Pipe:
 
         def _encode_jpeg(image: Image.Image, quality: int) -> Tuple[str, int]:
             buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=quality, optimize=True)
+            # `optimize=True` measurably slows big-image encoding for a tiny
+            # size gain; the quality ladder already handles the 10 MB limit.
+            image.save(buf, format="JPEG", quality=quality)
             raw = buf.getvalue()
             b64 = base64.b64encode(raw).decode("utf-8")
             return f"data:image/jpeg;base64,{b64}", len(raw)
@@ -404,13 +458,13 @@ class Pipe:
             ratio = max_side / max(w, h)
             return image.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
-        for quality in (95, 85, 75, 60, 45, 30):
+        for quality in (90, 80, 70, 60, 45, 30):
             data_url, raw_size = _encode_jpeg(img, quality)
             if raw_size <= self._MAX_B64_BYTES:
                 return data_url
 
-        img_resized = _resize_to_max(img, 2048)
-        for quality in (85, 70, 55, 40):
+        img_resized = _resize_to_max(img, 1536)
+        for quality in (80, 65, 50, 40):
             data_url, raw_size = _encode_jpeg(img_resized, quality)
             if raw_size <= self._MAX_B64_BYTES:
                 return data_url
@@ -426,53 +480,242 @@ class Pipe:
             "Please use a smaller source image."
         )
 
-    def _extract_images_from_message(
-        self, message: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Extract unique uploaded images from an Open WebUI message."""
-        raw_pil_images: List[Image.Image] = []
+    _FILE_ID_IN_URL_RE = re.compile(
+        r"/api/v1/files/([^/?#\s]+)(?:/content)?", re.IGNORECASE
+    )
+    _BARE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+    _B64_SIGNATURES = ("iVBORw0K", "/9j/", "UklGR", "R0lGOD", "PHN2Zy")
 
-        def _add_pil_from_b64_url(data_url: str):
-            try:
-                b64_data = data_url.split(",", 1)[1]
-                image_bytes = base64.b64decode(b64_data, validate=True)
-                pil_img = Image.open(io.BytesIO(image_bytes))
-                pil_img.load()
-                raw_pil_images.append(pil_img)
-            except Exception as e:
-                print(f"DEBUG: Error processing image: {e}")
+    @classmethod
+    def _owui_file_id(cls, ref: str) -> Optional[str]:
+        """Return the Open WebUI file id from a reference, if it is one."""
+        if not isinstance(ref, str) or not ref:
+            return None
+        if ref.startswith(cls._B64_SIGNATURES):
+            return None  # bare base64 image, not a file id
+        match = cls._FILE_ID_IN_URL_RE.search(ref)
+        if match:
+            return match.group(1)
+        if ref.startswith("/") or ref.startswith(("http://", "https://")):
+            return None
+        if cls._BARE_FILE_ID_RE.match(ref):
+            return ref
+        return None
 
-        def _add_from_string(value: str):
-            if not isinstance(value, str):
-                return
-            if value.startswith("data:image"):
-                _add_pil_from_b64_url(value)
+    @staticmethod
+    def _looks_like_image_ref(value: str) -> bool:
+        if not isinstance(value, str):
+            return False
+        v = value.strip()
+        if not v:
+            return False
+        if v.startswith("data:image/"):
+            return True
+        if v.startswith(("http://", "https://")):
+            return True
+        if v.startswith("/"):
+            return bool(
+                re.search(r"\.(?:png|jpe?g|webp|gif|bmp|avif|heic)(?:[?#]|$)", v, re.I)
+                or "/api/v1/files/" in v
+                or "/files/" in v
+            )
+        return False
 
-        # 1. Open WebUI file uploads and image payloads
+    @staticmethod
+    def _is_image_file_entry(file_item: Dict[str, Any]) -> bool:
+        if str(file_item.get("type") or "").lower() == "image":
+            return True
+        content_type = file_item.get("content_type")
+        if not content_type and isinstance(file_item.get("meta"), dict):
+            content_type = file_item["meta"].get("content_type")
+        return isinstance(content_type, str) and content_type.lower().startswith(
+            "image/"
+        )
+
+    @classmethod
+    def _collect_image_refs(cls, message: Dict[str, Any]) -> List[str]:
+        """Collect every image reference from one message (raw strings)."""
+        refs: List[str] = []
+
+        # message["files"] holds Open WebUI uploads AND generated images —
+        # usually as /api/v1/files/<id>/content, which the old data-URL-only
+        # extraction never saw, so follow-up edits silently turned into
+        # fresh generations.
         for file_item in message.get("files", []) or []:
-            if isinstance(file_item, dict):
-                _add_from_string(file_item.get("data", ""))
+            if isinstance(file_item, str):
+                if cls._looks_like_image_ref(file_item):
+                    refs.append(file_item)
+                continue
+            if not isinstance(file_item, dict):
+                continue
+            is_image = cls._is_image_file_entry(file_item)
+            content_type = file_item.get("content_type")
+            if not content_type and isinstance(file_item.get("meta"), dict):
+                content_type = file_item["meta"].get("content_type")
+            has_media_meta = bool(file_item.get("type") or content_type)
+            data = file_item.get("data")
+            url = (
+                file_item.get("url")
+                or file_item.get("content_url")
+                or file_item.get("path")
+            )
+            if not url and is_image and isinstance(file_item.get("id"), str) and file_item["id"]:
+                url = f"/api/v1/files/{file_item['id']}/content"
+            if isinstance(data, str) and data and (
+                is_image or data.startswith("data:image")
+            ):
+                refs.append(data)
+                continue
+            if isinstance(url, str) and url and (
+                is_image or (not has_media_meta and cls._looks_like_image_ref(url))
+            ):
+                refs.append(url)
 
-        for image_item in message.get("images", []) or []:
-            _add_from_string(image_item)
+        # message["images"] in every Open WebUI shape
+        for img in message.get("images", []) or []:
+            if isinstance(img, str):
+                refs.append(img)
+            elif isinstance(img, dict):
+                for key in ("url", "image_url", "content_url", "src"):
+                    value = img.get(key)
+                    if isinstance(value, dict):
+                        value = value.get("url")
+                    if isinstance(value, str) and value:
+                        refs.append(value)
+                        break
 
-        # 2. content list (image_url type or direct image field)
         content = message.get("content", "")
         if isinstance(content, list):
             for item in content:
                 if not isinstance(item, dict):
                     continue
-                if item.get("type") == "image_url":
-                    _add_from_string(item.get("image_url", {}).get("url", ""))
-                elif "image" in item:
-                    _add_from_string(item["image"])
+                if item.get("type") in ("image_url", "input_image", "image"):
+                    url = item.get("image_url", item.get("url", item.get("image", "")))
+                    if isinstance(url, dict):
+                        url = url.get("url", "")
+                    if isinstance(url, str) and url:
+                        refs.append(url)
+        elif isinstance(content, str):
+            # Markdown images: ![alt](url) — data URL, http(s), relative Open
+            # WebUI file reference or bare file id.
+            for url in re.findall(r"!\[[^\]]*\]\(([^)\s]+)", content):
+                refs.append(url)
 
-        # 3. Markdown images embedded in string content
-        if isinstance(content, str):
-            for data_url in re.findall(
-                r"!\[.*?\]\((data:image/[^;]+;base64,[^)]+)\)", content
-            ):
-                _add_from_string(data_url)
+        # normalize + dedupe while preserving order
+        normalized: List[str] = []
+        seen: set = set()
+        for ref in refs:
+            if not isinstance(ref, str):
+                continue
+            v = ref.strip().strip("<>").strip()
+            if not v or v in seen:
+                continue
+            if v.startswith(("data:", "http://", "https://", "/")):
+                pass
+            elif v.startswith(cls._B64_SIGNATURES):
+                v = f"data:image/png;base64,{v}"
+            elif cls._BARE_FILE_ID_RE.match(v):
+                v = f"/api/v1/files/{v}/content"
+            else:
+                continue
+            seen.add(v)
+            normalized.append(v)
+        return normalized
+
+    def _owui_headers(self, request=None) -> Dict[str, str]:
+        """Caller's own credentials so Open WebUI serves the file to us."""
+        headers: Dict[str, str] = {}
+        if request is not None:
+            auth = request.headers.get("authorization")
+            cookie = request.headers.get("cookie")
+            if auth:
+                headers["Authorization"] = auth
+            if cookie:
+                headers["Cookie"] = cookie
+        if "Authorization" not in headers and self.valves.files_api_token:
+            headers["Authorization"] = f"Bearer {self.valves.files_api_token}"
+        return headers
+
+    async def _resolve_ref_bytes(
+        self, ref: str, request=None
+    ) -> Optional[bytes]:
+        """Download/decode any supported image reference to raw bytes."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+
+        if ref.lower().startswith("data:"):
+            try:
+                return base64.b64decode(ref.split(",", 1)[1])
+            except Exception as e:
+                self._dbg("data URI decode failed:", e)
+                return None
+
+        base = str(request.base_url).rstrip("/") if request is not None else ""
+
+        if ref.startswith((("http://", "https://"))):
+            url = ref
+            src_host = urlparse(ref).netloc.lower()
+            base_host = urlparse(base).netloc.lower() if base else ""
+            # Only forward Open WebUI credentials to Open WebUI itself —
+            # never to DashScope/CDN hosts.
+            send_auth = bool(base_host) and src_host == base_host
+        elif ref.startswith("/"):
+            if not base:
+                self._dbg("cannot resolve server file without request base url:", ref)
+                return None
+            url = f"{base}{ref}"
+            send_auth = True
+        else:
+            file_id = self._owui_file_id(ref)
+            if not file_id or not base:
+                return None
+            url = f"{base}/api/v1/files/{file_id}/content"
+            send_auth = True
+
+        headers = self._owui_headers(request) if send_auth else {}
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+            self._dbg(f"image fetch failed HTTP {resp.status_code}: {url[:120]}")
+        except Exception as e:
+            self._dbg(f"image fetch error ({url[:120]}): {e}")
+        return None
+
+    @staticmethod
+    def _decode_pil(data: bytes) -> Optional[Image.Image]:
+        try:
+            pil_img = Image.open(io.BytesIO(data))
+            pil_img.load()
+            return pil_img
+        except Exception as e:
+            print(f"DEBUG: Error processing image: {e}")
+            return None
+
+    async def _extract_images_from_message(
+        self, message: Dict[str, Any], request=None
+    ) -> List[Dict[str, Any]]:
+        """Extract unique uploaded images from an Open WebUI message."""
+        refs = self._collect_image_refs(message)
+        if not refs:
+            return []
+
+        # Resolve references concurrently; identical refs are already deduped.
+        results = await asyncio.gather(
+            *[self._resolve_ref_bytes(ref, request) for ref in refs]
+        )
+
+        raw_pil_images: List[Image.Image] = []
+        for data in results:
+            if not data:
+                continue
+            # PIL decode runs in a worker thread so a big upload doesn't
+            # block the event loop (other chats keep responding).
+            pil_img = await anyio.to_thread.run_sync(self._decode_pil, data)
+            if pil_img is not None:
+                raw_pil_images.append(pil_img)
 
         if not raw_pil_images:
             return []
@@ -485,10 +728,120 @@ class Pipe:
                 seen.add(key)
                 unique_pils.append(img)
 
+        encoded = await asyncio.gather(
+            *[
+                anyio.to_thread.run_sync(self._image_to_base64, pil_img)
+                for pil_img in unique_pils
+            ]
+        )
         return [
-            {"pil": pil_img, "base64_url": self._image_to_base64(pil_img)}
-            for pil_img in unique_pils
+            {"pil": pil_img, "base64_url": b64}
+            for pil_img, b64 in zip(unique_pils, encoded)
         ]
+
+    # -------------------------------------------------------------------------
+    # Persist generated images as Open WebUI files
+    # -------------------------------------------------------------------------
+
+    def _dbg(self, *args) -> None:
+        print("DEBUG[qwen]:", *args)
+
+    @staticmethod
+    def _mime_from_bytes(payload: bytes, fallback: str = "image/png") -> str:
+        sig = payload[:12]
+        if sig.startswith(b"\x89PNG"):
+            return "image/png"
+        if sig.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if sig.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+            return "image/webp"
+        if sig.startswith(b"GIF8"):
+            return "image/gif"
+        return fallback
+
+    def _owui_upload_headers(self, request=None) -> Dict[str, str]:
+        return self._owui_headers(request)
+
+    async def _upload_to_owui(
+        self,
+        request,
+        payload: bytes,
+        mime: str,
+        filename: str,
+    ) -> Optional[str]:
+        """Upload image bytes to Open WebUI; returns a relative content URL."""
+        base = str(request.base_url).rstrip("/") if request is not None else ""
+        if not base:
+            self._dbg("cannot upload generated image without request base url")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{base}/api/v1/files/",
+                    params={"process": "false"},
+                    files={"file": (filename, payload, mime)},
+                    data={
+                        "metadata": json.dumps({"source": "qwen_image_pipe"})
+                    },
+                    headers=self._owui_upload_headers(request),
+                )
+            if resp.status_code != 200:
+                self._dbg(
+                    f"Open WebUI image upload failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:200]}"
+                )
+                return None
+            file_id = (resp.json() or {}).get("id")
+            if not file_id:
+                self._dbg("Open WebUI image upload returned no file id")
+                return None
+            return f"/api/v1/files/{file_id}/content"
+        except Exception as e:
+            self._dbg("Open WebUI image upload error:", e)
+            return None
+
+    async def _persist_image_urls(
+        self, image_urls: List[str], request=None
+    ) -> List[str]:
+        """Store generated images as Open WebUI files (in parallel).
+
+        DashScope image URLs expire after 24 hours and Open WebUI rewrites
+        inline base64 out of saved chat history — both leave a later "add a
+        hat" turn with nothing to edit. Stable file references fix that."""
+        if not self.valves.persist_generated_images or request is None:
+            return image_urls
+
+        async def _persist_one(url: str) -> str:
+            if not isinstance(url, str):
+                return url
+            if url.startswith("/api/v1/files/"):
+                return url
+            if url.startswith("data:"):
+                try:
+                    payload = base64.b64decode(url.split(",", 1)[1])
+                except Exception as e:
+                    self._dbg("could not decode generated image for upload:", e)
+                    return url
+            elif url.startswith(("http://", "https://")):
+                payload = await self._resolve_ref_bytes(url, request)
+                if not payload:
+                    return url
+            else:
+                return url
+            mime = self._mime_from_bytes(payload)
+            ext = {
+                "image/png": "png",
+                "image/jpeg": "jpg",
+                "image/webp": "webp",
+                "image/gif": "gif",
+            }.get(mime, "png")
+            file_url = await self._upload_to_owui(
+                request, payload, mime, f"qwen-image-{uuid.uuid4().hex}.{ext}"
+            )
+            return file_url or url
+
+        persisted = await asyncio.gather(*[_persist_one(url) for url in image_urls])
+        return list(persisted)
 
     # -------------------------------------------------------------------------
     # Size detection / resolution
@@ -727,7 +1080,7 @@ class Pipe:
             "Accept": "application/json",
         }
         max_attempts = 60
-        poll_interval = 2.0
+        poll_interval = 1.5
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0)
@@ -978,8 +1331,17 @@ class Pipe:
         __request__: Request,
         __user__: Dict[str, Any],
         __event_emitter__=None,
+        __task__=None,
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         """Route to generation or editing based on whether an image is attached."""
+
+        # Open WebUI background tasks (chat title, tags, follow-up questions)
+        # also call the selected model. Generating images for them wastes a
+        # paid API call, makes the next real request wait behind it and is a
+        # common reason the pipe "feels slow". Reply with nothing instead.
+        if __task__ or (__metadata__ or {}).get("task"):
+            return
 
         if not self.valves.api_key:
             yield self._error(
@@ -1012,10 +1374,22 @@ class Pipe:
                 return
 
             # Look for images in the current message, then earlier messages.
-            images = self._extract_images_from_message(last_message)
+            # Open WebUI may carry the current turn's uploads at the top level
+            # instead of inside the last message; merge them in first.
+            messages = list(messages)
+            last_message = dict(messages[-1]) if messages else {}
+            extra_files = body.get("files") or []
+            if extra_files:
+                existing = list(last_message.get("files") or [])
+                last_message["files"] = existing + [
+                    f for f in extra_files if f not in existing
+                ]
+                messages[-1] = last_message
+
+            images = await self._extract_images_from_message(last_message, __request__)
             if not images:
                 for msg in reversed(messages[:-1]):
-                    found = self._extract_images_from_message(msg)
+                    found = await self._extract_images_from_message(msg, __request__)
                     if found:
                         images = found
                         break
@@ -1078,6 +1452,10 @@ class Pipe:
                 urls = await self._generate_image(
                     model, user_prompt, size, __event_emitter__
                 )
+
+            # Persist results as Open WebUI files so later turns can edit them
+            # (DashScope URLs expire and Open WebUI rewrites inline base64).
+            urls = await self._persist_image_urls(urls, __request__)
 
             yield self._render(model, urls, size, is_editing)
 

@@ -1,7 +1,7 @@
 """
 title: LiteLLM Unified Image Generator & Editor (Manifold)
 author: adapted from dfirmans' OpenRouter image pipe
-version: 1.2.0
+version: 1.3.0
 description: >
   Unified Pipe for image generation and editing in Open WebUI via LiteLLM /
   a LiteLLM Proxy gateway (https://docs.litellm.ai).
@@ -11,6 +11,10 @@ description: >
   Optional fallback through `/v1/chat/completions` for proxies where the
   image routes are disabled and for chat-native image models
   (gemini image models, requires LiteLLM proxy >= 1.76.1).
+  Generated images are persisted as Open WebUI files and earlier turns'
+  images (uploads or previous results) are resolved back to bytes, so
+  follow-up prompts like "add a hat" actually edit the previous image
+  instead of generating a new one.
   This is a manifold pipe: set `models` to a comma-separated list of model
   names as configured in your LiteLLM proxy (config.yaml `model_list`) and
   each one will appear as a selectable model in Open WebUI.
@@ -50,6 +54,24 @@ class Pipe:
     the exact `model_name` strings your LiteLLM proxy serves (or qualified
     SDK ids like `gemini/gemini-2.5-flash-image` when the proxy simply
     forwards them). Each entry appears as its own model in Open WebUI.
+
+    v1.3.0:
+    - Fix image-to-image editing based on an image generated on an earlier
+      turn. Open WebUI (>= 0.11.4) now stores model-returned images as real
+      files and rewrites inline `data:image/...` Markdown to relative
+      `/api/v1/files/<id>/content` URLs. The previous extraction only
+      accepted `data:` URLs and absolute http(s) URLs with an image
+      extension, so the generated image became invisible to the pipe and the
+      follow-up turn did a FRESH generation instead of editing it. History
+      extraction now understands Open WebUI file references (relative or
+      absolute), `files[]`/`images[]` entries in every shape, and Markdown
+      image syntax with any URL. Referenced files are resolved back to bytes
+      (via the Open WebUI file-content endpoint, forwarding the caller's own
+      auth) before being sent to `/v1/images/edits`.
+    - New valve `persist_generated_images` (default True): generated images
+      are uploaded to Open WebUI storage and returned as stable
+      `/api/v1/files/<id>/content` references, so later turns can always edit
+      them. Falls back to inline data URLs when the upload is unavailable.
 
     v1.2.0:
     - Answer Open WebUI background task calls (chat title, tags, follow-up
@@ -192,6 +214,17 @@ class Pipe:
                 "to False to only use images attached to the newest message, "
                 "so follow-ups do a fresh generation instead of editing the "
                 "previous result."
+            ),
+        )
+        persist_generated_images: bool = Field(
+            default=True,
+            description=(
+                "Upload generated images to Open WebUI storage and return "
+                "them as /api/v1/files/<id>/content references instead of "
+                "inline base64. This keeps the images editable across turns "
+                "(Open WebUI rewrites inline base64 in chat history, which "
+                "breaks image-to-image editing) and keeps chats small. Set "
+                "to False to return inline base64 data URLs as before."
             ),
         )
         handle_task_calls_locally: bool = Field(
@@ -341,43 +374,167 @@ class Pipe:
     # Image extraction helpers (from the conversation)
     # ------------------------------------------------------------------
 
+    _FILE_ID_IN_URL_RE = re.compile(
+        r"/api/v1/files/([^/?#\s]+)(?:/content)?", re.IGNORECASE
+    )
+    _BARE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+    _B64_SIGNATURES = ("iVBORw0K", "/9j/", "UklGR", "R0lGOD", "PHN2Zy")
+
+    @classmethod
+    def _owui_file_id(cls, ref: str) -> Optional[str]:
+        """Return the Open WebUI file id from a reference, if it is one."""
+        if not isinstance(ref, str) or not ref:
+            return None
+        if ref.startswith(cls._B64_SIGNATURES):
+            return None  # bare base64 image, not a file id
+        match = cls._FILE_ID_IN_URL_RE.search(ref)
+        if match:
+            return match.group(1)
+        if ref.startswith("/") or ref.startswith(("http://", "https://")):
+            return None
+        if cls._BARE_FILE_ID_RE.match(ref):
+            return ref
+        return None
+
+    @staticmethod
+    def _looks_like_image_ref(value: str) -> bool:
+        if not isinstance(value, str):
+            return False
+        v = value.strip()
+        if not v:
+            return False
+        if v.startswith("data:image/"):
+            return True
+        if v.startswith(("http://", "https://")):
+            return True
+        if v.startswith("/"):
+            # Open WebUI file references and image-looking paths only. A
+            # plain relative link is not assumed to be an image.
+            return bool(
+                re.search(r"\.(?:png|jpe?g|webp|gif|bmp|avif|heic)(?:[?#]|$)", v, re.I)
+                or "/api/v1/files/" in v
+                or "/files/" in v
+            )
+        return False
+
+    @staticmethod
+    def _is_image_file_entry(file_item: Dict[str, Any]) -> bool:
+        if str(file_item.get("type") or "").lower() == "image":
+            return True
+        content_type = file_item.get("content_type")
+        if not content_type and isinstance(file_item.get("meta"), dict):
+            content_type = file_item["meta"].get("content_type")
+        return isinstance(content_type, str) and content_type.lower().startswith(
+            "image/"
+        )
+
+    @classmethod
+    def _normalize_refs(cls, refs: List[str]) -> List[str]:
+        """Normalize collected references to data URLs or resolvable URLs.
+
+        Bare (data-URL-less) base64 is wrapped; a bare Open WebUI file id is
+        turned into its /api/v1/files/<id>/content path; everything else is
+        kept as-is so `_image_to_part` can resolve it later."""
+        normalized: List[str] = []
+        for ref in refs:
+            if not isinstance(ref, str):
+                continue
+            v = ref.strip().strip("<>").strip()
+            if not v:
+                continue
+            if v.startswith(("data:", "http://", "https://")):
+                normalized.append(v)
+            elif v.startswith("/"):
+                normalized.append(v)
+            elif v.startswith(cls._B64_SIGNATURES):
+                normalized.append(cls._normalize_base64(v))
+            elif cls._BARE_FILE_ID_RE.match(v):
+                normalized.append(f"/api/v1/files/{v}/content")
+            else:
+                normalized.append(cls._normalize_base64(v))
+        return normalized
+
     def _extract_images_from_message(self, message: Dict[str, Any]) -> List[str]:
         images = []
 
-        for img in message.get("images", []):
+        # message["images"] is a first-class list of image handles in Open
+        # WebUI: plain strings (data URL / base64 / file URL) or dicts such as
+        # {"type": "image", "url": "..."} / {"image_url": {"url": "..."}}.
+        for img in message.get("images", []) or []:
             if isinstance(img, str):
-                if img.startswith("data:image"):
-                    images.append(img)
-                else:
-                    images.append(self._normalize_base64(img))
+                images.append(img)
+            elif isinstance(img, dict):
+                for key in ("url", "image_url", "content_url", "src"):
+                    value = img.get(key)
+                    if isinstance(value, dict):
+                        value = value.get("url")
+                    if isinstance(value, str) and value:
+                        images.append(value)
+                        break
 
-        for file_item in message.get("files", []):
-            if isinstance(file_item, dict):
-                data = file_item.get("data", "")
-                url = file_item.get("url", "")
-                if isinstance(data, str) and data.startswith("data:image"):
-                    images.append(data)
-                elif isinstance(url, str) and url.startswith(("http://", "https://")):
-                    images.append(url)
+        # message["files"] holds Open WebUI uploads AND generated images. A
+        # generated/uploaded image is referenced with a relative URL such as
+        # /api/v1/files/<id>/content — which earlier versions of this pipe
+        # ignored, making follow-up edits impossible.
+        for file_item in message.get("files", []) or []:
+            if isinstance(file_item, str):
+                if self._looks_like_image_ref(file_item):
+                    images.append(file_item)
+                continue
+            if not isinstance(file_item, dict):
+                continue
+            is_image = self._is_image_file_entry(file_item)
+            content_type = file_item.get("content_type")
+            if not content_type and isinstance(file_item.get("meta"), dict):
+                content_type = file_item["meta"].get("content_type")
+            has_media_meta = bool(
+                file_item.get("type") or content_type
+            )
+            data = file_item.get("data")
+            url = (
+                file_item.get("url")
+                or file_item.get("content_url")
+                or file_item.get("path")
+            )
+            if not url and is_image:
+                file_id = file_item.get("id")
+                if isinstance(file_id, str) and file_id:
+                    url = f"/api/v1/files/{file_id}/content"
+            if isinstance(data, str) and data and (
+                is_image or data.startswith("data:image")
+            ):
+                images.append(data)
+                continue
+            # Unlabelled entries (no type/content_type) are only trusted when
+            # the reference itself looks like an image; otherwise a text/PDF
+            # attachment would be mistaken for an image to edit.
+            if isinstance(url, str) and url and (
+                is_image or (not has_media_meta and self._looks_like_image_ref(url))
+            ):
+                images.append(url)
 
         content = message.get("content", "")
         if isinstance(content, list):
             for item in content:
-                if isinstance(item, dict) and item.get("type") == "image_url":
-                    url = item.get("image_url", {}).get("url", "")
-                    if url.startswith("data:image") or url.startswith(
-                        ("http://", "https://")
-                    ):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") in ("image_url", "input_image", "image"):
+                    url = item.get(
+                        "image_url", item.get("url", item.get("image", ""))
+                    )
+                    if isinstance(url, dict):
+                        url = url.get("url", "")
+                    if isinstance(url, str) and url:
                         images.append(url)
 
         if isinstance(content, str):
-            for data_url in re.findall(r"\((data:image/[^;]+;base64,[^)]+)\)", content):
-                images.append(data_url)
-            for http_url in re.findall(r"\((https?://\S+\.(?:png|jpe?g|webp|gif))\)",
-                                       content, re.IGNORECASE):
-                images.append(http_url)
+            # Markdown images: ![alt](url) — url may be a data URL, an
+            # absolute http(s) URL, a relative Open WebUI file reference
+            # (/api/v1/files/<id>/content) or a bare file id.
+            for url in re.findall(r"!\[[^\]]*\]\(([^)\s]+)", content):
+                images.append(url)
 
-        return self._dedupe_images(images)
+        return self._dedupe_images(self._normalize_refs(images))
 
     @classmethod
     def _dedupe_images(cls, image_urls: List[str]) -> List[str]:
@@ -470,33 +627,221 @@ class Pipe:
     }
 
     async def _image_to_part(
-        self, item: str, index: int
+        self, item: str, index: int, request=None, user: Optional[dict] = None
     ) -> Optional[Tuple[str, bytes, str]]:
-        """Convert a conversation image (data URL, bare base64, or remote URL)
-        into a multipart file part (filename, bytes, content_type)."""
+        """Convert a conversation image (data URL, bare base64, remote URL, or
+        Open WebUI file reference) into a multipart file part
+        (filename, bytes, content_type)."""
         try:
-            if item.startswith("data:"):
-                mime, payload = self._decode_data_url(item)
-            elif item.startswith(("http://", "https://")):
-                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as dl:
-                    resp = await dl.get(item)
-                    resp.raise_for_status()
-                    payload = resp.content
-                    mime = (resp.headers.get("content-type") or "").split(";")[0]
-                if not mime.startswith("image/"):
-                    mime = self._mime_from_bytes(payload)
-            else:
-                payload = base64.b64decode(
-                    re.sub(r"\s+", "", item) + "=" * (-len(re.sub(r"\s+", "", item)) % 4),
-                    validate=False,
-                )
-                mime = self._mime_from_bytes(payload)
+            data_url = await self._to_data_url(item, request=request, user=user)
+            if not data_url:
+                return None
+            mime, payload = self._decode_data_url(data_url)
         except Exception as e:
             print(f"WARNING: could not convert input image #{index}: {e}")
             return None
 
         ext = self.EXT_BY_MIME.get(mime, "png")
         return f"input_image_{index}.{ext}", payload, mime
+
+    async def _to_data_url(
+        self, item: str, request=None, user: Optional[dict] = None
+    ) -> Optional[str]:
+        """Resolve any accepted image reference to a `data:image/...` URL."""
+        item = (item or "").strip()
+        if item.startswith("data:"):
+            return item
+
+        if self._owui_file_id(item):
+            data_url = await self._fetch_owui_file(item, request=request, user=user)
+            if data_url:
+                return data_url
+            return None
+
+        if item.startswith(("http://", "https://")):
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as dl:
+                resp = await dl.get(item)
+                resp.raise_for_status()
+                payload = resp.content
+                mime = (resp.headers.get("content-type") or "").split(";")[0]
+            if not mime.startswith("image/"):
+                mime = self._mime_from_bytes(payload)
+            return f"data:{mime};base64,{base64.b64encode(payload).decode('utf-8')}"
+
+        payload = base64.b64decode(
+            re.sub(r"\s+", "", item) + "=" * (-len(re.sub(r"\s+", "", item)) % 4),
+            validate=False,
+        )
+        return f"data:{self._mime_from_bytes(payload)};base64,{base64.b64encode(payload).decode('utf-8')}"
+
+    # ------------------------------------------------------------------
+    # Open WebUI file access (generated images & uploads)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _owui_base(request) -> str:
+        if request is None:
+            return ""
+        try:
+            return str(request.base_url).rstrip("/")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _owui_headers(request) -> Dict[str, str]:
+        """Forward the caller's own auth so Open WebUI serves the file to us."""
+        headers: Dict[str, str] = {}
+        if request is None:
+            return headers
+        for header, key in (("authorization", "Authorization"), ("cookie", "Cookie")):
+            value = request.headers.get(header)
+            if value:
+                headers[key] = value
+        return headers
+
+    async def _fetch_owui_file(
+        self, ref: str, request=None, user: Optional[dict] = None
+    ) -> Optional[str]:
+        """Read an Open WebUI image file reference back as a data URL.
+
+        Accepts `/api/v1/files/<id>/content`, an absolute URL of the same
+        shape, or a bare file id. Reads are authorized with the caller's own
+        credentials so Open WebUI's ownership checks still apply."""
+        file_id = self._owui_file_id(ref)
+        if not file_id:
+            return None
+
+        base = self._owui_base(request)
+        if base:
+            if ref.startswith(("http://", "https://")):
+                target = ref
+            elif ref.startswith("/"):
+                target = f"{base}{ref}"
+            else:
+                target = f"{base}/api/v1/files/{file_id}/content"
+            try:
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as dl:
+                    resp = await dl.get(target, headers=self._owui_headers(request))
+                    resp.raise_for_status()
+                    payload = resp.content
+                    mime = (resp.headers.get("content-type") or "").split(";")[0]
+                if not mime.startswith("image/"):
+                    mime = self._mime_from_bytes(payload)
+                return f"data:{mime};base64,{base64.b64encode(payload).decode('utf-8')}"
+            except Exception as e:
+                print(f"WARNING: could not read Open WebUI file {file_id}: {e}")
+
+        # Fallback: read straight from Open WebUI's storage layer.
+        try:
+            from open_webui.utils.files import (  # type: ignore
+                get_image_base64_from_file_id,
+            )
+        except Exception:
+            return None
+        user_obj = await self._user_model(user)
+        if user_obj is None:
+            return None
+        try:
+            data_url = await get_image_base64_from_file_id(file_id, user_obj)
+            return data_url or None
+        except Exception as e:
+            print(f"WARNING: internal read of Open WebUI file {file_id} failed: {e}")
+            return None
+
+    @staticmethod
+    async def _user_model(user: Optional[dict]):
+        if not user:
+            return None
+        try:
+            from open_webui.models.users import Users  # type: ignore
+        except Exception:
+            return None
+        user_id = user.get("id")
+        if not user_id:
+            return None
+        try:
+            result = Users.get_user_by_id(user_id)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+        except Exception:
+            return None
+
+    async def _persist_image_urls(
+        self, image_urls: List[str], request=None, body: Optional[dict] = None
+    ) -> List[str]:
+        """Store generated images as Open WebUI files.
+
+        Returns the references to render in the chat: relative
+        `/api/v1/files/<id>/content` URLs when the upload succeeded, otherwise
+        the original (inline) reference. Persisting matters because Open
+        WebUI rewrites inline base64 out of the saved chat, which would leave
+        a follow-up "add a hat" turn with no image to edit."""
+        if not self.valves.persist_generated_images or request is None:
+            return image_urls
+
+        metadata_source = (body or {}).get("metadata") or {}
+        metadata = {
+            "source": "litellm_image_pipe",
+            "chat_id": metadata_source.get("chat_id"),
+            "message_id": metadata_source.get("message_id"),
+        }
+
+        persisted: List[str] = []
+        for url in image_urls:
+            if not (isinstance(url, str) and url.startswith("data:")):
+                persisted.append(url)
+                continue
+            try:
+                mime, payload = self._decode_data_url(url)
+            except Exception as e:
+                print(f"WARNING: could not decode generated image for upload: {e}")
+                persisted.append(url)
+                continue
+            file_url = await self._upload_generated_image(
+                request, payload, mime, metadata
+            )
+            persisted.append(file_url or url)
+        return persisted
+
+    async def _upload_generated_image(
+        self,
+        request,
+        payload: bytes,
+        mime: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[str]:
+        """Upload image bytes to Open WebUI; returns a relative content URL."""
+        base = self._owui_base(request)
+        if not base:
+            return None
+        ext = self.EXT_BY_MIME.get(mime, "png")
+        filename = f"litellm-image-{uuid.uuid4().hex}.{ext}"
+        meta = dict(metadata or {})
+        meta.setdefault("source", "litellm_image_pipe")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{base}/api/v1/files/",
+                    params={"process": "false"},
+                    files={"file": (filename, payload, mime)},
+                    data={"metadata": json.dumps(meta)},
+                    headers=self._owui_headers(request),
+                )
+            if resp.status_code != 200:
+                print(
+                    f"WARNING: Open WebUI image upload failed "
+                    f"(HTTP {resp.status_code}): {resp.text[:200]}"
+                )
+                return None
+            file_id = (resp.json() or {}).get("id")
+            if not file_id:
+                print("WARNING: Open WebUI image upload returned no file id.")
+                return None
+            return f"/api/v1/files/{file_id}/content"
+        except Exception as e:
+            print(f"WARNING: Open WebUI image upload failed: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Size / ratio detection
@@ -772,6 +1117,8 @@ class Pipe:
         prompt: str,
         size: Optional[str],
         input_images: List[str],
+        request=None,
+        user: Optional[dict] = None,
     ) -> List[str]:
         """Text-to-image -> /v1/images/generations (JSON);
         image-to-image -> /v1/images/edits (multipart)."""
@@ -779,7 +1126,7 @@ class Pipe:
             url = self._api_url("images/edits")
             parts = []
             for idx, item in enumerate(input_images[: self.valves.max_input_images]):
-                part = await self._image_to_part(item, idx)
+                part = await self._image_to_part(item, idx, request=request, user=user)
                 if part:
                     parts.append(part)
             if not parts:
@@ -956,11 +1303,13 @@ class Pipe:
         prompt: str,
         input_images: List[str],
         size: Optional[str],
+        request=None,
+        user: Optional[dict] = None,
     ) -> List[str]:
         errors = []
         try:
             return await self._generate_with_images_route(
-                model_id, prompt, size, input_images
+                model_id, prompt, size, input_images, request=request, user=user
             )
         except Exception as e:
             errors.append(f"Images route error: {e}")
@@ -1166,7 +1515,19 @@ class Pipe:
                 yield self._stop_chunk(model_id)
                 return
 
-            input_images = self._find_images_in_conversation(body["messages"])
+            # Open WebUI may carry the current turn's uploads at the top level
+            # instead of inside the last message; merge them in so an upload
+            # is never missed.
+            messages = body["messages"]
+            extra_files = body.get("files") or []
+            if extra_files and messages:
+                messages = list(messages)
+                last = dict(messages[-1])
+                existing = list(last.get("files") or [])
+                last["files"] = existing + [f for f in extra_files if f not in existing]
+                messages[-1] = last
+
+            input_images = self._find_images_in_conversation(messages)
             is_editing = len(input_images) > 0
 
             if is_editing:
@@ -1224,7 +1585,7 @@ class Pipe:
                 )
 
             image_urls = await self._generate_image(
-                model_id, prompt, input_images, size
+                model_id, prompt, input_images, size, request=__request__, user=__user__
             )
 
             if __event_emitter__:
@@ -1240,6 +1601,12 @@ class Pipe:
 
             op_text = "edited" if is_editing else "generated"
             tip = random.choice(self.tooltips)
+
+            # Persist generated images as Open WebUI files so the next turn
+            # can edit them (see _persist_image_urls).
+            image_urls = await self._persist_image_urls(
+                image_urls, request=__request__, body=body
+            )
 
             if len(image_urls) == 1:
                 images_md = f"![Result]({image_urls[0]})"
